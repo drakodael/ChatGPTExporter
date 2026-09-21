@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Local Exporter",
-  "version": "1.2-private",
-  "description": "Export the currently open ChatGPT conversation to a local Markdown file. No analytics, attachments, raw JSON, clipboard access, background worker, native messaging, or persistent site access.",
+  "version": "2.3-private",
+  "description": "Export the active ChatGPT conversation to local Markdown, optionally with images in a ZIP. Image CDN access is optional. For image export only, the ChatGPT session token may be held transiently in extension memory and sent only to OpenAI's image CDN as an authenticated retry. No persistence, analytics, raw JSON, clipboard, background worker, or native messaging.",
   "icons": {
     "48": "images/icon-48.png",
     "96": "images/icon-96.png",
@@ -23,5 +23,8 @@
   "permissions": [
     "scripting",
     "activeTab"
+  ],
+  "optional_host_permissions": [
+    "https://*.oaiusercontent.com/*"
   ]
 }
