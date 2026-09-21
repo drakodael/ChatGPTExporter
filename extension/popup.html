@@ -7,9 +7,19 @@
 </head>
 <body>
   <h1>Export ChatGPT Chat</h1>
+
+  <label class="option">
+    <input id="images" type="checkbox">
+    <span>
+      <strong>Include images</strong>
+      <small>Creates a ZIP with conversation.md + images/. Safari may ask once for access to OpenAI's image CDN.</small>
+    </span>
+  </label>
+
   <button id="download" type="button">Export Markdown</button>
-  <p class="privacy">Local only · Markdown text only · no attachments · no analytics · no native app</p>
-  <p id="status" class="muted">Open a ChatGPT conversation and export it to Downloads.</p>
+
+  <p class="privacy">Local only · active tab only · image CDN permission is optional · no analytics · no native app</p>
+  <p id="status" class="muted">Open a ChatGPT conversation and export it locally.</p>
 
   <script src="exporter.js"></script>
   <script src="export-core.js"></script>
