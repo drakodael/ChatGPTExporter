@@ -9,7 +9,7 @@
 * { box-sizing: border-box; }
 
 body {
-  width: 320px;
+  width: 330px;
   margin: 0;
   padding: 14px 16px 16px;
   font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
@@ -23,6 +23,37 @@ h1 {
   font-weight: 600;
 }
 
+.option {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin: 0 0 12px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  border-radius: 8px;
+}
+
+.option input {
+  margin: 2px 0 0;
+}
+
+.option span {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.option strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.option small {
+  margin-top: 1px;
+  font-size: 11px;
+  opacity: 0.68;
+}
+
 button {
   width: 100%;
   padding: 9px 12px;
@@ -34,6 +65,7 @@ button {
   border-radius: 8px;
   cursor: pointer;
 }
+
 button:hover { background: var(--accent-press); }
 button:disabled { opacity: 0.55; cursor: default; }
 
