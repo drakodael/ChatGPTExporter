@@ -1,9 +1,10 @@
-// This function is injected only into the active ChatGPT tab after the user
-// clicks the extension. It makes same-origin requests only to chatgpt.com and
-// returns Markdown-ready text to the extension. It does not download files,
-// return the access token, export raw JSON, use analytics, or contact third-party
-// hosts.
-async function pageExport() {
+// Privacy-focused ChatGPT export parser.
+// Injected only after the user clicks the extension on the active chatgpt.com tab.
+// Same-origin requests read the open conversation. When includeImages=true, only
+// image_asset_pointer entries are resolved; PDFs, generic attachments, raw JSON,
+// sandbox files, Canvas documents, clipboard data, and third-party analytics are
+// deliberately excluded.
+async function pageExport(includeImages) {
   if (window.__chatgptLocalExporterBusy) {
     return { error: "An export is already running for this chat." };
   }
@@ -16,16 +17,20 @@ async function pageExport() {
       return { error: "This page is not an open ChatGPT conversation." };
     }
 
-    async function fetchJSON(url, options, timeoutMs) {
+    async function fetchWithTimeout(url, options, timeoutMs) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
       try {
-        const response = await fetch(url, { ...(options || {}), signal: ctrl.signal });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
+        return await fetch(url, { ...(options || {}), signal: ctrl.signal });
       } finally {
         clearTimeout(timer);
       }
+    }
+
+    async function fetchJSON(url, options, timeoutMs) {
+      const response = await fetchWithTimeout(url, options, timeoutMs);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
     }
 
     let session;
@@ -69,10 +74,10 @@ async function pageExport() {
       return String(text || "")
         .replace(citationToken, "")
         .replace(/【[^】]*】/g, "")
-        .replace(/:::[A-Za-z][\\w-]*(?:\\{[^}]*\\})?/g, "")
-        .replace(/^[ \\t]*:::[ \\t]*$/gm, "")
-        .replace(/[ \\t]+\\n/g, "\\n")
-        .replace(/\\n{3,}/g, "\\n\\n")
+        .replace(/:::[A-Za-z][\w-]*(?:\{[^}]*\})?/g, "")
+        .replace(/^[ \t]*:::[ \t]*$/gm, "")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
         .trim();
     }
 
@@ -84,6 +89,29 @@ async function pageExport() {
       noteByURL.set(url, num);
       notes.push({ num, url, title: title || url });
       return num;
+    }
+
+    function fileIdOf(pointer) {
+      const value = typeof pointer === "string" ? pointer : "";
+      const match = value.match(/^(?:file-service|sediment):\/\/(.+)$/);
+      return match ? match[1] : value || null;
+    }
+
+    function isImagePart(part) {
+      return !!part && typeof part === "object" && part.content_type === "image_asset_pointer";
+    }
+
+    function hasImage(message) {
+      return ((message.content && message.content.parts) || []).some(isImagePart);
+    }
+
+    const imageOrder = [];
+    const imageSeen = new Set();
+
+    function rememberImage(fid) {
+      if (!fid || imageSeen.has(fid)) return;
+      imageSeen.add(fid);
+      imageOrder.push(fid);
     }
 
     function baseText(message) {
@@ -98,7 +126,16 @@ async function pageExport() {
             if (typeof part === "string") return part;
             if (!part || typeof part !== "object") return "";
             if (typeof part.text === "string") return part.text;
-            if (part.content_type === "image_asset_pointer") return "_[image omitted]_";
+
+            if (isImagePart(part)) {
+              const fid = fileIdOf(part.asset_pointer);
+              if (includeImages && fid) {
+                rememberImage(fid);
+                return `@@IMG@@${fid}@@`;
+              }
+              return "_[image omitted]_";
+            }
+
             if (part.content_type === "audio_asset_pointer") return "_[audio omitted]_";
             return "";
           })
@@ -134,8 +171,14 @@ async function pageExport() {
     function attachmentNote(message) {
       const attachments = (message.metadata && message.metadata.attachments) || [];
       const names = attachments
+        .filter((a) => {
+          if (!a) return false;
+          if (includeImages && String(a.mime_type || "").startsWith("image/")) return false;
+          return true;
+        })
         .map((a) => a && a.name)
         .filter(Boolean);
+
       if (!names.length) return "";
       return names.map((name) => `_[attachment omitted: ${name}]_`).join("\n");
     }
@@ -146,21 +189,121 @@ async function pageExport() {
       if (msg.recipient && msg.recipient !== "all") continue;
 
       const role = msg.author && msg.author.role;
-      if (role !== "user" && role !== "assistant") continue;
+      const toolImage = role === "tool" && hasImage(msg);
+      if (role !== "user" && role !== "assistant" && !toolImage) continue;
 
       const speaker = role === "user" ? "User" : "ChatGPT";
       const text = [renderText(msg), attachmentNote(msg)].filter(Boolean).join("\n\n").trim();
       if (!text) continue;
 
-      turns.push({ id, role, md: `## ${speaker}\n\n${text}\n` });
+      turns.push({ id, role: role === "tool" ? "assistant" : role, md: `## ${speaker}\n\n${text}\n` });
     }
 
-    return {
+    const result = {
       convId,
       title: convo.title || "ChatGPT conversation",
       turns,
       footnotes: notes,
     };
+
+    if (!includeImages || !imageOrder.length) {
+      if (includeImages) result.images = [];
+      return result;
+    }
+
+    const auth = { headers: { Authorization: `Bearer ${accessToken}` } };
+
+    async function resolveImage(fid) {
+      const endpoints = [
+        `/backend-api/files/download/${encodeURIComponent(fid)}`,
+        `/backend-api/files/${encodeURIComponent(fid)}/download`,
+      ];
+
+      for (const endpoint of endpoints) {
+        try {
+          const response = await fetchWithTimeout(endpoint, auth, 20000);
+          if (!response.ok) continue;
+
+          const contentType = response.headers.get("content-type") || "";
+          if (contentType.includes("application/json")) {
+            const payload = await response.json();
+            const url =
+              payload.download_url ||
+              (payload.metadata && payload.metadata.download_url) ||
+              null;
+            if (!url) continue;
+
+            return {
+              fileId: fid,
+              url,
+              mime:
+                (payload.metadata && payload.metadata.mime_type) ||
+                payload.mime_type ||
+                null,
+              originalName:
+                (payload.metadata && payload.metadata.file_name) ||
+                payload.file_name ||
+                null,
+            };
+          }
+
+          if (response.redirected || contentType.startsWith("image/")) {
+            try {
+              if (response.body) response.body.cancel();
+            } catch (_) {}
+
+            return {
+              fileId: fid,
+              url: response.url || endpoint,
+              mime: contentType || null,
+              originalName: null,
+            };
+          }
+        } catch (_) {
+          // Try the next endpoint shape. Missing images are handled gracefully.
+        }
+      }
+
+      return { fileId: fid, url: null, mime: null, originalName: null };
+    }
+
+    const resolved = [];
+    for (const fid of imageOrder) {
+      resolved.push(await resolveImage(fid));
+    }
+
+    function extensionFor(image) {
+      const name = image.originalName || "";
+      const match = name.match(/\.([A-Za-z0-9]{2,5})$/);
+      if (match) {
+        const ext = match[1].toLowerCase();
+        if (["png", "jpg", "jpeg", "webp", "gif", "avif"].includes(ext)) {
+          return ext === "jpeg" ? "jpg" : ext;
+        }
+      }
+
+      const mime = String(image.mime || "").toLowerCase();
+      if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
+      if (mime.includes("webp")) return "webp";
+      if (mime.includes("gif")) return "gif";
+      if (mime.includes("avif")) return "avif";
+      return "png";
+    }
+
+    result.images = resolved.map((image, index) => ({
+      fileId: image.fileId,
+      url: image.url,
+      mime: image.mime,
+      name: `image-${String(index + 1).padStart(3, "0")}.${extensionFor(image)}`,
+    }));
+
+    // Image export only: return the bearer token transiently to the popup so it
+    // can retry OpenAI CDN downloads that reject an otherwise valid signed URL.
+    // The popup never persists, logs, archives, or forwards this token outside
+    // approved OpenAI image CDN hosts.
+    result.token = accessToken;
+
+    return result;
   } finally {
     window.__chatgptLocalExporterBusy = false;
   }
