@@ -3,7 +3,10 @@ const downloadBtn = document.getElementById("download");
 const imagesToggle = document.getElementById("images");
 
 const CHATGPT_URL = /^https:\/\/chatgpt\.com\//;
-const IMAGE_CDN_PERMISSION = "https://*.oaiusercontent.com/*";
+const IMAGE_HOST_PERMISSIONS = [
+  "https://chatgpt.com/*",
+  "https://*.oaiusercontent.com/*",
+];
 
 function setStatus(message, kind = "") {
   statusEl.textContent = message;
@@ -39,7 +42,7 @@ function requestImageCDNPermissionFromGesture() {
   // Safari requires permissions.request() to be invoked synchronously from
   // the user's click handler, before any await or other async boundary.
   return browser.permissions.request({
-    origins: [IMAGE_CDN_PERMISSION],
+    origins: IMAGE_HOST_PERMISSIONS,
   });
 }
 
@@ -49,7 +52,7 @@ function isAllowedImageURL(value) {
     const host = u.hostname.toLowerCase();
     return (
       u.protocol === "https:" &&
-      (host === "oaiusercontent.com" || host.endsWith(".oaiusercontent.com"))
+      (host === "chatgpt.com" || host === "oaiusercontent.com" || host.endsWith(".oaiusercontent.com"))
     );
   } catch (_) {
     return false;
@@ -335,7 +338,7 @@ function buildImageExportReport(images, fetched, hadToken) {
 
   const lines = [
     "ChatGPT Local Exporter - image export report",
-    "Version: 2.5-diagnostic",
+    "Version: 2.6-private",
     "",
     `Images detected: ${detected}`,
     `Images with resolved URL: ${resolvedURLs}`,
@@ -439,7 +442,7 @@ async function exportConversation(includeImages, permissionPromise) {
     }
 
     if (includeImages) {
-      setStatus("Requesting access to OpenAI's image CDN…");
+      setStatus("Requesting access to ChatGPT image hosts…");
 
       let granted = false;
       try {
@@ -454,7 +457,7 @@ async function exportConversation(includeImages, permissionPromise) {
 
       if (!granted) {
         setStatus(
-          "Image export was cancelled because Safari did not grant access to OpenAI's image CDN.",
+          "Image export was cancelled because Safari did not grant access to the ChatGPT image hosts.",
           "err"
         );
         return;
