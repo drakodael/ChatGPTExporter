@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Local Exporter",
-  "version": "2.5-diagnostic",
-  "description": "Diagnostic image-export build. Adds only rejected CDN hostnames to export-report.txt so image host permissions can be corrected without recording signed URLs, paths, file IDs, or tokens.",
+  "version": "2.6-private",
+  "description": "Export the active ChatGPT conversation to local Markdown, optionally with images in a ZIP. Normal permissions remain activeTab + scripting. Image export requests temporary host access to chatgpt.com and OpenAI's image CDN only when Include images is selected; the session token is held transiently in memory for authenticated image downloads and is never persisted.",
   "icons": {
     "48": "images/icon-48.png",
     "96": "images/icon-96.png",
@@ -25,6 +25,7 @@
     "activeTab"
   ],
   "optional_host_permissions": [
+    "https://chatgpt.com/*",
     "https://*.oaiusercontent.com/*"
   ]
 }
