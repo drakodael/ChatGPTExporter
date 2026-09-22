@@ -216,6 +216,7 @@ async function fetchImagesForArchive(images, accessToken) {
     http_other: 0,
     content_type: 0,
     network: 0,
+    invalid_hostnames: {},
   };
 
   function recordHTTP(status) {
@@ -276,6 +277,15 @@ async function fetchImagesForArchive(images, accessToken) {
     if (!isAllowedImageURL(image.url)) {
       files.set(image.fileId, null);
       diagnostics.invalid_host++;
+
+      try {
+        const host = new URL(image.url).hostname.toLowerCase();
+        if (host) {
+          diagnostics.invalid_hostnames[host] =
+            (diagnostics.invalid_hostnames[host] || 0) + 1;
+        }
+      } catch (_) {}
+
       failed++;
       continue;
     }
@@ -325,7 +335,7 @@ function buildImageExportReport(images, fetched, hadToken) {
 
   const lines = [
     "ChatGPT Local Exporter - image export report",
-    "Version: 2.4-private",
+    "Version: 2.5-diagnostic",
     "",
     `Images detected: ${detected}`,
     `Images with resolved URL: ${resolvedURLs}`,
@@ -346,6 +356,11 @@ function buildImageExportReport(images, fetched, hadToken) {
     `http-other: ${d.http_other || 0}`,
     `content-type: ${d.content_type || 0}`,
     `network: ${d.network || 0}`,
+    "",
+    "Rejected hostnames (hostname only; no URL path/query):",
+    ...Object.entries(d.invalid_hostnames || {})
+      .sort((a, b) => b[1] - a[1])
+      .map(([host, count]) => `${host}: ${count}`),
     "",
     "Privacy:",
     "- This report contains aggregate counts only.",
