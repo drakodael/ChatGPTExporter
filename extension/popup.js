@@ -192,7 +192,7 @@ function buildZipBlob(entries) {
   u16(ev, 20, 0);
 
   return new Blob([...localParts, ...centralParts, end], {
-    type: "application/octet-stream",
+    type: "application/zip",
   });
 }
 
@@ -327,7 +327,7 @@ async function fetchImagesForArchive(images, accessToken) {
   return { files, failed, diagnostics };
 }
 
-function buildImageExportReport(images, fetched, hadToken) {
+function buildImageExportReport(images, fetched, hadToken, resolutionDiagnostics) {
   const d = (fetched && fetched.diagnostics) || {};
   const detected = Array.isArray(images) ? images.length : 0;
   const resolvedURLs = (images || []).filter((image) => image && image.url).length;
@@ -335,10 +335,11 @@ function buildImageExportReport(images, fetched, hadToken) {
     ? [...fetched.files.values()].filter(Boolean).length
     : 0;
   const failed = fetched ? fetched.failed : detected;
+  const r = resolutionDiagnostics || {};
 
   const lines = [
     "ChatGPT Local Exporter - image export report",
-    "Version: 2.6-private",
+    "Version: 2.7-private",
     "",
     `Images detected: ${detected}`,
     `Images with resolved URL: ${resolvedURLs}`,
@@ -364,6 +365,20 @@ function buildImageExportReport(images, fetched, hadToken) {
     ...Object.entries(d.invalid_hostnames || {})
       .sort((a, b) => b[1] - a[1])
       .map(([host, count]) => `${host}: ${count}`),
+    "",
+    "Resolver diagnostics (aggregate only):",
+    `success-json: ${r.success_json || 0}`,
+    `success-response: ${r.success_response || 0}`,
+    `json-no-url: ${r.json_no_url || 0}`,
+    `html-rejected: ${r.html_rejected || 0}`,
+    `resolver-401: ${r.http_401 || 0}`,
+    `resolver-403: ${r.http_403 || 0}`,
+    `resolver-404: ${r.http_404 || 0}`,
+    `resolver-429: ${r.http_429 || 0}`,
+    `resolver-5xx: ${r.http_5xx || 0}`,
+    `resolver-http-other: ${r.http_other || 0}`,
+    `resolver-network: ${r.network || 0}`,
+    `resolver-retries: ${r.retries || 0}`,
     "",
     "Privacy:",
     "- This report contains aggregate counts only.",
@@ -416,11 +431,25 @@ function buildArchiveMarkdown(markdownTemplate, images, fetched) {
 }
 
 function downloadBlobFromPopup(filename, blob) {
-  const url = URL.createObjectURL(blob);
+  // Safari has been observed to name popup-originated Blob downloads "Unknown".
+  // Wrap the ZIP Blob in a File so both the object URL and the anchor carry the
+  // intended filename and application/zip MIME type.
+  let downloadable = blob;
+  try {
+    downloadable = new File([blob], filename, {
+      type: "application/zip",
+      lastModified: Date.now(),
+    });
+  } catch (_) {
+    // Older engines can fall back to the Blob + download attribute path.
+  }
+
+  const url = URL.createObjectURL(downloadable);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   a.rel = "noopener";
+  a.type = "application/zip";
   a.style.display = "none";
   document.body.appendChild(a);
   a.click();
@@ -520,7 +549,7 @@ async function exportConversation(includeImages, permissionPromise) {
         failed: 0,
         diagnostics: {},
       };
-      const report = buildImageExportReport(images, emptyFetched, false);
+      const report = buildImageExportReport(images, emptyFetched, false, {});
       const entries = [
         {
           name: "conversation.md",
@@ -546,7 +575,7 @@ async function exportConversation(includeImages, permissionPromise) {
     setStatus("Building ZIP locally…");
 
     const entries = buildArchiveMarkdown(markdown, images, fetched);
-    const report = buildImageExportReport(images, fetched, !!accessToken);
+    const report = buildImageExportReport(images, fetched, !!accessToken, result.resolutionDiagnostics || {});
     entries.push({
       name: "export-report.txt",
       data: new TextEncoder().encode(report),
