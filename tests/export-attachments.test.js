@@ -4,6 +4,7 @@ const vm = require('node:vm');
 const test = require('node:test');
 
 const source = fs.readFileSync('extension/popup.js', 'utf8');
+const coreSource = fs.readFileSync('extension/export-core.js', 'utf8');
 
 function loadHelpers(fetchImpl) {
   const elements = new Map();
@@ -32,9 +33,85 @@ function loadHelpers(fetchImpl) {
     console,
   };
   vm.createContext(context);
-  vm.runInContext(`${source}\nthis.testAPI = { safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive };`, context);
+  vm.runInContext(coreSource, context);
+  vm.runInContext(`${source}\nthis.testAPI = { safeName, exportFilename: typeof exportFilename === 'undefined' ? null : exportFilename, safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive, buildZipBlob };`, context);
   return context.testAPI;
 }
+
+async function readStoredZipEntries(blob) {
+  const bytes = Buffer.from(await blob.arrayBuffer());
+  const endOffset = bytes.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.notEqual(endOffset, -1);
+  const count = bytes.readUInt16LE(endOffset + 10);
+  let centralOffset = bytes.readUInt32LE(endOffset + 16);
+  const entries = new Map();
+
+  for (let index = 0; index < count; index++) {
+    assert.equal(bytes.readUInt32LE(centralOffset), 0x02014b50);
+    const nameLength = bytes.readUInt16LE(centralOffset + 28);
+    const extraLength = bytes.readUInt16LE(centralOffset + 30);
+    const commentLength = bytes.readUInt16LE(centralOffset + 32);
+    const name = bytes.subarray(centralOffset + 46, centralOffset + 46 + nameLength).toString('utf8');
+    const localOffset = bytes.readUInt32LE(centralOffset + 42);
+    const localNameLength = bytes.readUInt16LE(localOffset + 26);
+    const localExtraLength = bytes.readUInt16LE(localOffset + 28);
+    const dataLength = bytes.readUInt32LE(localOffset + 22);
+    const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+    entries.set(name, bytes.subarray(dataOffset, dataOffset + dataLength));
+    centralOffset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+test('export filenames use only the sanitized title and requested extension', () => {
+  const { exportFilename } = loadHelpers();
+  assert.equal(exportFilename('Casos Whatsapp', 'md'), 'Casos Whatsapp.md');
+  assert.equal(exportFilename('Casos Whatsapp', 'zip'), 'Casos Whatsapp.zip');
+  assert.doesNotMatch(exportFilename('Casos Whatsapp', 'zip'), /\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{2}/);
+});
+
+test('conversation title sanitization preserves safe Unicode and replaces filename-special characters', () => {
+  const { safeName } = loadHelpers();
+  assert.equal(safeName('  Árvore 日本語 😀  '), 'Árvore 日本語 😀');
+  assert.equal(safeName('A/B:C*D?E"F<G>H|I\\J'), 'A_B_C_D_E_F_G_H_I_J');
+  assert.equal(safeName('.Casos Whatsapp.'), 'Casos Whatsapp');
+  assert.equal(safeName(' ... '), 'chatgpt');
+  assert.equal([...safeName('é'.repeat(100))].length, 80);
+  assert.equal(safeName(`${'x'.repeat(79)}.abc`), 'x'.repeat(79));
+  assert.equal(safeName(`${'x'.repeat(79)} abc`), 'x'.repeat(79));
+});
+
+test('ZIP paths share the sanitized conversation root while Markdown links and attachment names stay relative', async () => {
+  const { safeName, buildZipBlob, addAttachmentsToArchive } = loadHelpers();
+  const root = safeName('Casos Whatsapp');
+  const markdown = '![image](images/image-001.png)\n\n[archivo.pdf](attachments/archivo.pdf)';
+  const entries = [
+    { name: 'conversation.md', data: new TextEncoder().encode(markdown) },
+    { name: 'export-report.txt', data: new TextEncoder().encode('aggregate report') },
+    { name: 'images/image-001.png', data: new Uint8Array([1, 2, 3]) },
+  ];
+  addAttachmentsToArchive(entries, [{ fileId: 'pdf-1', name: 'archivo.pdf', bytes: new Uint8Array([4, 5, 6]) }]);
+
+  const zipEntries = await readStoredZipEntries(buildZipBlob(entries, root));
+  assert.deepEqual([...zipEntries.keys()].sort(), [
+    'Casos Whatsapp/',
+    'Casos Whatsapp/attachments/',
+    'Casos Whatsapp/attachments/archivo.pdf',
+    'Casos Whatsapp/conversation.md',
+    'Casos Whatsapp/export-report.txt',
+    'Casos Whatsapp/images/',
+    'Casos Whatsapp/images/image-001.png',
+  ]);
+  assert.equal(zipEntries.get('Casos Whatsapp/conversation.md').toString(), markdown);
+  assert.ok(zipEntries.has(`${root}/attachments/archivo.pdf`));
+
+  const emptyZipEntries = await readStoredZipEntries(buildZipBlob([
+    { name: 'conversation.md', data: new TextEncoder().encode('# Casos Whatsapp') },
+    { name: 'export-report.txt', data: new TextEncoder().encode('aggregate report') },
+  ], root));
+  assert.ok(emptyZipEntries.has('Casos Whatsapp/images/'));
+  assert.ok(emptyZipEntries.has('Casos Whatsapp/attachments/'));
+});
 
 test('attachment names are sanitized and retain a safe extension', () => {
   const { safeAttachmentName } = loadHelpers();

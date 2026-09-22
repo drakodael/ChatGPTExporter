@@ -141,15 +141,22 @@ function dosTimeDate(date) {
 // Build a stored (uncompressed) ZIP as Blob parts. Images are already compressed,
 // so re-compressing PNG/JPEG/WebP would add CPU without meaningful savings.
 // Returning a Blob avoids allocating a second full-size copy of the archive.
-function buildZipBlob(entries) {
+function buildZipBlob(entries, rootName) {
   const enc = new TextEncoder();
   const now = dosTimeDate(new Date());
   const localParts = [];
   const centralParts = [];
   let localOffset = 0;
   let centralSize = 0;
+  const emptyDirectory = () => new Uint8Array(0);
+  const rootedEntries = [
+    { name: `${rootName}/`, data: emptyDirectory() },
+    { name: `${rootName}/images/`, data: emptyDirectory() },
+    { name: `${rootName}/attachments/`, data: emptyDirectory() },
+    ...entries.map((entry) => ({ ...entry, name: `${rootName}/${entry.name}` })),
+  ];
 
-  for (const entry of entries) {
+  for (const entry of rootedEntries) {
     const nameBytes = enc.encode(entry.name);
     const data = entry.data;
     const crc = crc32(data);
@@ -202,8 +209,8 @@ function buildZipBlob(entries) {
   u32(ev, 0, 0x06054b50);
   u16(ev, 4, 0);
   u16(ev, 6, 0);
-  u16(ev, 8, entries.length);
-  u16(ev, 10, entries.length);
+  u16(ev, 8, rootedEntries.length);
+  u16(ev, 10, rootedEntries.length);
   u32(ev, 12, centralSize);
   u32(ev, 16, localOffset);
   u16(ev, 20, 0);
@@ -664,10 +671,10 @@ async function exportConversation(includeImages, includeAttachments, permissionP
     }
 
     const markdown = buildMarkdown(result);
-    const base = `${safeName(result.title)}-${timestamp()}`;
+    const base = safeName(result.title);
 
     if (!includeImages && !includeAttachments) {
-      const filename = `${base}.md`;
+      const filename = exportFilename(result.title, "md");
 
       try {
         await browser.scripting.executeScript({
@@ -689,7 +696,7 @@ async function exportConversation(includeImages, includeAttachments, permissionP
     const accessToken = typeof result.token === "string" ? result.token : null;
     delete result.token;
     if (!images.length && !attachmentDescriptors.length) {
-      const filename = `${base}.zip`;
+      const filename = exportFilename(result.title, "zip");
       const emptyFetched = {
         files: new Map(),
         failed: 0,
@@ -706,7 +713,7 @@ async function exportConversation(includeImages, includeAttachments, permissionP
           data: new TextEncoder().encode(report),
         },
       ];
-      downloadBlobFromPopup(filename, buildZipBlob(entries));
+      downloadBlobFromPopup(filename, buildZipBlob(entries, base));
       setStatus("✓ ZIP requested. No exportable images were found in this chat.", "ok");
       return;
     }
@@ -734,8 +741,8 @@ async function exportConversation(includeImages, includeAttachments, permissionP
       data: new TextEncoder().encode(report),
     });
 
-    const filename = `${base}.zip`;
-    const zipBlob = buildZipBlob(entries);
+    const filename = exportFilename(result.title, "zip");
+    const zipBlob = buildZipBlob(entries, base);
 
     downloadBlobFromPopup(filename, zipBlob);
 

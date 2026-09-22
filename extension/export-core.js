@@ -11,7 +11,12 @@ function safeName(title) {
   const cleaned = String(title || "ChatGPT conversation")
     .replace(/[\\/:*?"<>|]+/g, "_")
     .replace(/^[.\s]+|[.\s]+$/g, "");
-  return [...cleaned].slice(0, 80).join("") || "chatgpt";
+  const limited = [...cleaned].slice(0, 80).join("").replace(/[.\s]+$/g, "");
+  return limited || "chatgpt";
+}
+
+function exportFilename(title, extension) {
+  return `${safeName(title)}.${extension}`;
 }
 
 function appendFootnotes(md, notes) {
