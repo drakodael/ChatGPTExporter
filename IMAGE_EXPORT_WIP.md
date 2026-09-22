@@ -208,3 +208,27 @@ unzip -p Unknown export-report.txt
 ```
 
 or upload the resulting ZIP for inspection.
+
+
+### v2.6 — allow the actual ChatGPT image endpoint
+
+The v2.5 report showed that 135 image URLs resolved successfully but all were
+rejected because their hostname was `chatgpt.com`.
+
+v2.6 keeps normal permissions unchanged:
+
+```text
+activeTab
+scripting
+```
+
+When **Include images** is selected, Safari now requests temporary host access to:
+
+```text
+https://chatgpt.com/*
+https://*.oaiusercontent.com/*
+```
+
+The popup accepts only those HTTPS hosts. ChatGPT image endpoints are tried
+without credentials first and, if needed, retried with the transient bearer
+token. The token is never persisted.
