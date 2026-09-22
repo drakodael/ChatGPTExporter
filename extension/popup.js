@@ -245,8 +245,9 @@ function buildZipBlob(entries, rootName) {
   const emptyDirectory = () => new Uint8Array(0);
   const rootedEntries = [
     { name: `${rootName}/`, data: emptyDirectory() },
-    { name: `${rootName}/images/`, data: emptyDirectory() },
-    { name: `${rootName}/attachments/`, data: emptyDirectory() },
+    { name: `${rootName}/archivos adjuntos/`, data: emptyDirectory() },
+    { name: `${rootName}/archivos adjuntos/imágenes/`, data: emptyDirectory() },
+    { name: `${rootName}/archivos adjuntos/documentos/`, data: emptyDirectory() },
     ...entries.map((entry) => ({ ...entry, name: `${rootName}/${entry.name}` })),
   ];
 
@@ -670,10 +671,10 @@ function buildArchiveMarkdown(markdownTemplate, images, fetched) {
       markdown = replaceAllLiteral(
         markdown,
         token,
-        `![image](images/${file.name})`
+        `![image](${archiveMarkdownPath(`archivos adjuntos/imágenes/${file.name}`)})`
       );
       entries.push({
-        name: `images/${file.name}`,
+        name: `archivos adjuntos/imágenes/${file.name}`,
         data: file.bytes,
       });
     } else {
@@ -698,6 +699,43 @@ function buildArchiveMarkdown(markdownTemplate, images, fetched) {
   return entries;
 }
 
+function archiveMarkdownPath(path) {
+  return path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+function buildIndexMarkdown(title, counts) {
+  const images = (counts && counts.images) || {};
+  const documents = (counts && counts.documents) || {};
+  const imageFolder = archiveMarkdownPath("archivos adjuntos/imágenes/");
+  const documentFolder = archiveMarkdownPath("archivos adjuntos/documentos/");
+
+  return [
+    `# ${String(title || "ChatGPT conversation")}`,
+    "",
+    "`conversation.md` es la transcripción principal.",
+    "",
+    "## Exportación",
+    "",
+    `- Images detected: ${images.detected || 0}`,
+    `- Images downloaded: ${images.downloaded || 0}`,
+    `- Images failed: ${images.failed || 0}`,
+    `- Documents detected: ${documents.detected || 0}`,
+    `- Documents downloaded: ${documents.downloaded || 0}`,
+    `- Documents failed: ${documents.failed || 0}`,
+    "",
+    "## Archivos",
+    "",
+    "- [Transcripción](conversation.md)",
+    `- [Carpeta de imágenes](${imageFolder})`,
+    `- [Carpeta de documentos](${documentFolder})`,
+    "",
+    "## Continuidad",
+    "",
+    "Si un tema largo continúa en otro chat de ChatGPT, guarda cada exportación o parte (por ejemplo, Parte 01 y Parte 02) dentro de la misma carpeta de conversación en Drive. Usa este `INDEX.md` como punto de entrada y consulta cada transcripción por separado; el exportador no fusiona exportaciones.",
+    "",
+  ].join("\n");
+}
+
 function uniqueAttachmentArchiveNames(attachments) {
   const usedNames = new Set();
   const names = new Map();
@@ -720,7 +758,7 @@ function addAttachmentsToArchive(entries, attachments) {
   const names = uniqueAttachmentArchiveNames(attachments);
   for (const attachment of attachments || []) {
     const name = names.get(attachment && attachment.attachmentKey);
-    if (name) entries.push({ name: `attachments/${name}`, data: attachment.bytes });
+    if (name) entries.push({ name: `archivos adjuntos/documentos/${name}`, data: attachment.bytes });
   }
 }
 
@@ -733,7 +771,7 @@ function linkDownloadedAttachments(markdown, descriptors, files) {
     if (!file) continue;
     const label = descriptor.name || file.name;
     const archiveName = archiveNames.get(file.attachmentKey) || file.name;
-    output = replaceAllLiteral(output, `_[attachment omitted: ${label}]_`, `[${label.replace(/\]/g, "\\]")}](attachments/${archiveName})`);
+    output = replaceAllLiteral(output, `_[attachment omitted: ${label}]_`, `[${label.replace(/\]/g, "\\]")}](${archiveMarkdownPath(`archivos adjuntos/documentos/${archiveName}`)})`);
   }
   return output;
 }
@@ -867,6 +905,13 @@ async function exportConversation(includeImages, includeAttachments, permissionP
       );
       const entries = [
         {
+          name: "INDEX.md",
+          data: new TextEncoder().encode(buildIndexMarkdown(result.title, {
+            images: { detected: 0, downloaded: 0, failed: 0 },
+            documents: { detected: 0, downloaded: 0, failed: 0 },
+          })),
+        },
+        {
           name: "conversation.md",
           data: new TextEncoder().encode(markdown),
         },
@@ -911,6 +956,21 @@ async function exportConversation(includeImages, includeAttachments, permissionP
     entries.push({
       name: "export-report.txt",
       data: new TextEncoder().encode(report),
+    });
+    entries.push({
+      name: "INDEX.md",
+      data: new TextEncoder().encode(buildIndexMarkdown(result.title, {
+        images: {
+          detected: images.length - imageSelection.skipped.length,
+          downloaded: imageDownloaded,
+          failed: fetched.failed,
+        },
+        documents: {
+          detected: attachmentDescriptors.length,
+          downloaded: fetchedAttachments.files.length,
+          failed: fetchedAttachments.failed,
+        },
+      })),
     });
 
     const filename = exportFilename(result.title, "zip");

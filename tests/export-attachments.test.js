@@ -67,7 +67,7 @@ function loadHelpers(fetchImpl) {
   };
   vm.createContext(context);
   vm.runInContext(coreSource, context);
-  vm.runInContext(`${source}\nthis.testAPI = { safeName, exportFilename: typeof exportFilename === 'undefined' ? null : exportFilename, safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive, buildZipBlob, downloadFileInPage: typeof downloadFileInPage === 'undefined' ? null : downloadFileInPage, downloadZipFromPopup: typeof downloadZipFromPopup === 'undefined' ? null : downloadZipFromPopup, zipTransferChunkBytes: typeof ZIP_TRANSFER_CHUNK_BYTES === 'undefined' ? null : ZIP_TRANSFER_CHUNK_BYTES, hasPendingZipTransfer: () => Object.prototype.hasOwnProperty.call(globalThis, '__chatgptExporterZipTransfer') };`, context);
+  vm.runInContext(`${source}\nthis.testAPI = { safeName, exportFilename: typeof exportFilename === 'undefined' ? null : exportFilename, safeAttachmentName, buildExportReport, buildIndexMarkdown: typeof buildIndexMarkdown === 'undefined' ? null : buildIndexMarkdown, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive, buildZipBlob, downloadFileInPage: typeof downloadFileInPage === 'undefined' ? null : downloadFileInPage, downloadZipFromPopup: typeof downloadZipFromPopup === 'undefined' ? null : downloadZipFromPopup, zipTransferChunkBytes: typeof ZIP_TRANSFER_CHUNK_BYTES === 'undefined' ? null : ZIP_TRANSFER_CHUNK_BYTES, hasPendingZipTransfer: () => Object.prototype.hasOwnProperty.call(globalThis, '__chatgptExporterZipTransfer') };`, context);
   return Object.assign(context.testAPI, { downloadNames, injectedCalls, createdBlobs, revokedUrls, storageAccesses });
 }
 
@@ -140,6 +140,8 @@ async function readStoredZipEntries(blob) {
   for (let index = 0; index < count; index++) {
     assert.equal(bytes.readUInt32LE(centralOffset), 0x02014b50);
     const nameLength = bytes.readUInt16LE(centralOffset + 28);
+    const flags = bytes.readUInt16LE(centralOffset + 8);
+    assert.equal(flags & 0x0800, 0x0800);
     const extraLength = bytes.readUInt16LE(centralOffset + 30);
     const commentLength = bytes.readUInt16LE(centralOffset + 32);
     const name = bytes.subarray(centralOffset + 46, centralOffset + 46 + nameLength).toString('utf8');
@@ -207,36 +209,67 @@ test('normal extension permissions remain exactly activeTab and scripting', () =
   assert.deepEqual(permissions, ['activeTab', 'scripting']);
 });
 
-test('ZIP paths share the sanitized conversation root while Markdown links and attachment names stay relative', async () => {
-  const { safeName, buildZipBlob, addAttachmentsToArchive } = loadHelpers();
+test('ZIP paths use the Drive-friendly UTF-8 tree and keep Markdown links relative', async () => {
+  const { safeName, buildZipBlob, buildIndexMarkdown, addAttachmentsToArchive } = loadHelpers();
   const root = safeName('Casos Whatsapp');
-  const markdown = '![image](images/image-001.png)\n\n[archivo.pdf](attachments/archivo.pdf)';
+  const markdown = '![image](archivos%20adjuntos/im%C3%A1genes/image-001.png)\n\n[archivo.pdf](archivos%20adjuntos/documentos/archivo.pdf)';
+  const index = buildIndexMarkdown('Casos Whatsapp', {
+    images: { detected: 1, downloaded: 1, failed: 0 },
+    documents: { detected: 1, downloaded: 1, failed: 0 },
+  });
   const entries = [
     { name: 'conversation.md', data: new TextEncoder().encode(markdown) },
+    { name: 'INDEX.md', data: new TextEncoder().encode(index) },
     { name: 'export-report.txt', data: new TextEncoder().encode('aggregate report') },
-    { name: 'images/image-001.png', data: new Uint8Array([1, 2, 3]) },
+    { name: 'archivos adjuntos/imágenes/image-001.png', data: new Uint8Array([1, 2, 3]) },
   ];
   addAttachmentsToArchive(entries, [{ attachmentKey: 'pdf-1', name: 'archivo.pdf', bytes: new Uint8Array([4, 5, 6]) }]);
 
   const zipEntries = await readStoredZipEntries(buildZipBlob(entries, root));
   assert.deepEqual([...zipEntries.keys()].sort(), [
     'Casos Whatsapp/',
-    'Casos Whatsapp/attachments/',
-    'Casos Whatsapp/attachments/archivo.pdf',
+    'Casos Whatsapp/INDEX.md',
+    'Casos Whatsapp/archivos adjuntos/',
+    'Casos Whatsapp/archivos adjuntos/documentos/',
+    'Casos Whatsapp/archivos adjuntos/documentos/archivo.pdf',
+    'Casos Whatsapp/archivos adjuntos/imágenes/',
+    'Casos Whatsapp/archivos adjuntos/imágenes/image-001.png',
     'Casos Whatsapp/conversation.md',
     'Casos Whatsapp/export-report.txt',
-    'Casos Whatsapp/images/',
-    'Casos Whatsapp/images/image-001.png',
   ]);
   assert.equal(zipEntries.get('Casos Whatsapp/conversation.md').toString(), markdown);
-  assert.ok(zipEntries.has(`${root}/attachments/archivo.pdf`));
+  assert.equal(zipEntries.get('Casos Whatsapp/INDEX.md').toString(), index);
+  assert.match(zipEntries.get('Casos Whatsapp/INDEX.md').toString(), /Continuidad/);
+  assert.ok(zipEntries.has(`${root}/archivos adjuntos/documentos/archivo.pdf`));
 
   const emptyZipEntries = await readStoredZipEntries(buildZipBlob([
+    { name: 'INDEX.md', data: new TextEncoder().encode('# Casos Whatsapp') },
     { name: 'conversation.md', data: new TextEncoder().encode('# Casos Whatsapp') },
     { name: 'export-report.txt', data: new TextEncoder().encode('aggregate report') },
   ], root));
-  assert.ok(emptyZipEntries.has('Casos Whatsapp/images/'));
-  assert.ok(emptyZipEntries.has('Casos Whatsapp/attachments/'));
+  assert.ok(emptyZipEntries.has('Casos Whatsapp/archivos adjuntos/imágenes/'));
+  assert.ok(emptyZipEntries.has('Casos Whatsapp/archivos adjuntos/documentos/'));
+});
+
+test('INDEX contains only title, aggregate counts, local paths, and continuity guidance', () => {
+  const { buildIndexMarkdown } = loadHelpers();
+  const index = buildIndexMarkdown('Casos Whatsapp', {
+    images: { detected: 4, downloaded: 3, failed: 1, id: 'private-id-456', url: 'https://private.example/image' },
+    documents: { detected: 2, downloaded: 1, failed: 1, name: 'private-attachment-name.pdf', token: 'private-token-value' },
+  });
+  assert.match(index, /^# Casos Whatsapp/m);
+  assert.match(index, /conversation\.md/);
+  assert.match(index, /archivos%20adjuntos\/im%C3%A1genes/);
+  assert.match(index, /archivos%20adjuntos\/documentos/);
+  assert.match(index, /Images detected: 4/);
+  assert.match(index, /Images downloaded: 3/);
+  assert.match(index, /Images failed: 1/);
+  assert.match(index, /Documents detected: 2/);
+  assert.match(index, /Documents downloaded: 1/);
+  assert.match(index, /Documents failed: 1/);
+  assert.match(index, /Continuidad/);
+  assert.match(index, /Parte 01/);
+  assert.doesNotMatch(index, /private-attachment-name|private-id-456|private\.example|private-token-value|Bearer|https?:\/\/|file-id-123|signed-url|transient-secret-token|message body/i);
 });
 
 test('attachment names are sanitized and retain a safe extension', () => {
@@ -268,11 +301,13 @@ test('successful original attachment is archived separately from image entries',
   const images = [{ fileId: 'image-id', name: 'image-001.png' }];
   const fetchedImages = { files: new Map([['image-id', { name: 'image-001.png', bytes: new Uint8Array([1]) }]]), failed: 0, diagnostics: {} };
   const entries = buildArchiveMarkdown('# Chat\n\n@@IMG@@image-id@@', images, fetchedImages);
+  const archivedMarkdown = Buffer.from(entries.find((entry) => entry.name === 'conversation.md').data).toString('utf8');
+  assert.match(archivedMarkdown, /!\[image\]\(archivos%20adjuntos\/im%C3%A1genes\/image-001\.png\)/);
   const attachments = [{ attachmentKey: 'private-id', name: 'receipt.pdf', bytes: new Uint8Array([2]) }];
   const { addAttachmentsToArchive } = loadHelpers();
   addAttachmentsToArchive(entries, attachments);
-  assert.ok(entries.some((entry) => entry.name === 'images/image-001.png'));
-  assert.ok(entries.some((entry) => entry.name === 'attachments/receipt.pdf'));
+  assert.ok(entries.some((entry) => entry.name === 'archivos adjuntos/imágenes/image-001.png'));
+  assert.ok(entries.some((entry) => entry.name === 'archivos adjuntos/documentos/receipt.pdf'));
 });
 
 test('attachment links point to the archived local file and duplicate names stay unique', () => {
@@ -283,9 +318,9 @@ test('attachment links point to the archived local file and duplicate names stay
   ];
   const entries = [];
   addAttachmentsToArchive(entries, files);
-  assert.deepEqual(entries.map((entry) => entry.name), ['attachments/receipt.pdf', 'attachments/receipt-2.pdf']);
+  assert.deepEqual(entries.map((entry) => entry.name), ['archivos adjuntos/documentos/receipt.pdf', 'archivos adjuntos/documentos/receipt-2.pdf']);
   const markdown = linkDownloadedAttachments('_[attachment omitted: receipt.pdf]_ @@IMG@@preview@@', [{ attachmentKey: 'one', name: 'receipt.pdf' }], files);
-  assert.match(markdown, /\[receipt\.pdf\]\(attachments\/receipt\.pdf\)/);
+  assert.match(markdown, /\[receipt\.pdf\]\(archivos%20adjuntos\/documentos\/receipt\.pdf\)/);
   assert.match(markSkippedPDFPreviews(markdown, [{ fileId: 'preview', previewAttachmentId: 'one' }], files), /original PDF: receipt\.pdf/);
 });
 
@@ -570,7 +605,7 @@ test('PDF fallback keeps preview association and replaces the omitted attachment
   const markdown = result.turns.map((turn) => turn.md).join('\n');
   const linked = helpers.linkDownloadedAttachments(markdown, result.attachments, fetchedAttachments.files);
   const output = helpers.markSkippedPDFPreviews(linked, imageSelection.skipped, fetchedAttachments.files);
-  assert.match(output, /\[receipt\.pdf\]\(attachments\/receipt\.pdf\)/);
+  assert.match(output, /\[receipt\.pdf\]\(archivos%20adjuntos\/documentos\/receipt\.pdf\)/);
   assert.match(output, /PDF page preview omitted; original PDF: receipt\.pdf/);
   const fetchedImages = await helpers.fetchImagesForArchive(imageSelection.images, null);
   assert.equal(fetchedImages.failed, 0);
