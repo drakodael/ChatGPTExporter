@@ -709,12 +709,15 @@ test('image resolver diagnostics classify unresolved image assets without leakin
   assert.equal(result.imageDiscoveryDiagnostics.pointer_missing_or_invalid, 0);
   assert.equal(result.imageDiscoveryDiagnostics.unique_discovered, 1);
   assert.equal(result.imageDiscoveryDiagnostics.preview_associated, 1);
-  assert.equal(result.resolutionDiagnostics.attempts, 2);
+  assert.equal(result.resolutionDiagnostics.attempts, 4);
   assert.equal(result.resolutionDiagnostics.resolved, 0);
   assert.equal(result.resolutionDiagnostics.final_no_url, 1);
-  assert.equal(result.resolutionDiagnostics.http_403, 2);
-  assert.equal(result.resolutionDiagnostics.endpoint_1_http_403, 1);
-  assert.equal(result.resolutionDiagnostics.endpoint_2_http_403, 1);
+  assert.equal(result.resolutionDiagnostics.http_403, 4);
+  assert.equal(result.resolutionDiagnostics.endpoint_1_http_403, 2);
+  assert.equal(result.resolutionDiagnostics.endpoint_2_http_403, 2);
+  assert.equal(result.resolutionDiagnostics.scoped_attempts, 2);
+  assert.equal(result.resolutionDiagnostics.scoped_resolved, 0);
+  assert.equal(result.resolutionDiagnostics.scoped_http_403, 2);
 
   const report = loadHelpers().buildExportReport(
     { detected: 1, downloaded: 0, failed: 1, excluded_pdf_previews: 0, diagnostics: { no_url: 1 } },
@@ -726,8 +729,10 @@ test('image resolver diagnostics classify unresolved image assets without leakin
   );
   assert.match(report, /image-source-image_asset_pointer: 1/);
   assert.match(report, /image-resolver-final_no_url: 1/);
-  assert.match(report, /image-resolver-endpoint_1-http_403: 1/);
-  assert.match(report, /image-resolver-endpoint_2-http_403: 1/);
+  assert.match(report, /image-resolver-endpoint_1-http_403: 2/);
+  assert.match(report, /image-resolver-endpoint_2-http_403: 2/);
+  assert.match(report, /image-resolver-scoped-attempts: 2/);
+  assert.match(report, /image-resolver-scoped-http_403: 2/);
   for (const secret of [
     privateImageId,
     privatePdfId,
@@ -756,4 +761,112 @@ test('file export report distinguishes PDF-preview exclusion from remaining imag
   assert.match(report, /image-unique-discovered: 137/);
   assert.match(report, /image-resolver-final_no_url: 2/);
   assert.match(report, /image-no_url: 2/);
+});
+
+
+test('image resolver keeps the unscoped fast path when endpoint one succeeds', async () => {
+  const imageId = 'image-fast-path';
+  const signedURL = 'https://files.oaiusercontent.com/image-fast-path.png';
+  const harness = createPageExportHarness(null, (url, _call, jsonResponse) => {
+    if (url === `/backend-api/files/download/${imageId}`) {
+      return jsonResponse({ download_url: signedURL, mime_type: 'image/png' });
+    }
+    throw new Error('scoped or fallback endpoint should not be requested');
+  }, imageId);
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, signedURL);
+  assert.deepEqual(harness.endpointCalls.map((call) => call.url), [
+    `/backend-api/files/download/${imageId}`,
+  ]);
+  assert.equal(result.resolutionDiagnostics.scoped_attempts, 0);
+  assert.equal(result.resolutionDiagnostics.scoped_resolved, 0);
+});
+
+test('image resolver retries with conversation scope only after both unscoped endpoints return 403', async () => {
+  const conversationId = '12345678-1234-1234-1234-123456789012';
+  const imageId = 'scoped-image-private-id';
+  const signedURL = 'https://files.oaiusercontent.com/private-scoped-image-url';
+  const harness = createPageExportHarness(null, (url, _call, jsonResponse) => {
+    if (url === `/backend-api/files/download/${imageId}`) return jsonResponse({}, { ok: false, status: 403 });
+    if (url === `/backend-api/files/${imageId}/download`) return jsonResponse({}, { ok: false, status: 403 });
+    if (url === `/backend-api/files/download/${imageId}?conversation_id=${conversationId}&inline=false`) {
+      return jsonResponse({ download_url: signedURL, mime_type: 'image/png' });
+    }
+    throw new Error('unexpected image resolver request');
+  }, imageId, conversationId);
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, signedURL);
+  assert.deepEqual(harness.endpointCalls.map((call) => call.url), [
+    `/backend-api/files/download/${imageId}`,
+    `/backend-api/files/${imageId}/download`,
+    `/backend-api/files/download/${imageId}?conversation_id=${conversationId}&inline=false`,
+  ]);
+  assert.equal(result.resolutionDiagnostics.scoped_attempts, 1);
+  assert.equal(result.resolutionDiagnostics.scoped_resolved, 1);
+  assert.equal(result.resolutionDiagnostics.scoped_http_403, 0);
+  assert.equal(result.resolutionDiagnostics.endpoint_1_scoped_attempts, 1);
+  assert.equal(result.resolutionDiagnostics.endpoint_1_scoped_resolved, 1);
+
+  const report = loadHelpers().buildExportReport(
+    { detected: 1, downloaded: 1, failed: 0, diagnostics: {} },
+    { detected: 0, downloaded: 0, failed: 0, diagnostics: {} },
+    true,
+    {},
+    result.resolutionDiagnostics,
+    result.imageDiscoveryDiagnostics
+  );
+  assert.match(report, /image-resolver-scoped-attempts: 1/);
+  assert.match(report, /image-resolver-scoped-resolved: 1/);
+  for (const secret of [conversationId, imageId, signedURL, 'resolver-test-bearer-secret']) {
+    assert.equal(report.includes(secret), false);
+  }
+});
+
+test('image scoped fallback advances to endpoint two after a scoped 403', async () => {
+  const conversationId = '12345678-1234-1234-1234-123456789012';
+  const imageId = 'scoped-endpoint-two-image';
+  const signedURL = 'https://files.oaiusercontent.com/scoped-endpoint-two.png';
+  const harness = createPageExportHarness(null, (url, _call, jsonResponse) => {
+    if (!url.includes('conversation_id=')) return jsonResponse({}, { ok: false, status: 403 });
+    if (url.startsWith(`/backend-api/files/download/${imageId}?`)) return jsonResponse({}, { ok: false, status: 403 });
+    if (url.startsWith(`/backend-api/files/${imageId}/download?`)) return jsonResponse({ download_url: signedURL });
+    throw new Error('unexpected image resolver request');
+  }, imageId, conversationId);
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, signedURL);
+  assert.equal(result.resolutionDiagnostics.scoped_attempts, 2);
+  assert.equal(result.resolutionDiagnostics.scoped_resolved, 1);
+  assert.equal(result.resolutionDiagnostics.scoped_http_403, 1);
+  assert.equal(result.resolutionDiagnostics.endpoint_1_scoped_http_403, 1);
+  assert.equal(result.resolutionDiagnostics.endpoint_2_scoped_resolved, 1);
+});
+
+test('image resolver does not use scoped fallback for terminal failures other than two 403 responses', async (t) => {
+  const fixtures = [
+    {
+      name: '404',
+      handler: (_url, _call, jsonResponse) => jsonResponse({}, { ok: false, status: 404 }),
+    },
+    {
+      name: 'json without download URL',
+      handler: (_url, _call, jsonResponse) => jsonResponse({ metadata: {} }),
+    },
+    {
+      name: 'network failure',
+      handler: () => { throw new TypeError('private network detail'); },
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, async () => {
+      const harness = createPageExportHarness(null, fixture.handler, 'non-403-image');
+      const result = await harness.pageExport(true);
+      assert.equal(result.images[0].url, null);
+      assert.equal(result.resolutionDiagnostics.scoped_attempts, 0);
+      assert.equal(result.resolutionDiagnostics.scoped_resolved, 0);
+    });
+  }
 });

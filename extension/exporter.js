@@ -300,6 +300,15 @@ async function pageExport(includeImages, includeAttachments) {
       endpoint_2_attempts: 0,
       endpoint_1_resolved: 0,
       endpoint_2_resolved: 0,
+      scoped_attempts: 0,
+      scoped_resolved: 0,
+      scoped_http_403: 0,
+      endpoint_1_scoped_attempts: 0,
+      endpoint_2_scoped_attempts: 0,
+      endpoint_1_scoped_resolved: 0,
+      endpoint_2_scoped_resolved: 0,
+      endpoint_1_scoped_http_403: 0,
+      endpoint_2_scoped_http_403: 0,
       ...Object.fromEntries([1, 2].flatMap((endpointNumber) =>
         imageResolverOutcomeKeys.map((key) => [`endpoint_${endpointNumber}_${key}`, 0])
       )),
@@ -319,55 +328,60 @@ async function pageExport(includeImages, includeAttachments) {
       resolutionDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
     }
 
-    async function resolveImage(fid) {
-      const endpoints = [
-        `/backend-api/files/download/${encodeURIComponent(fid)}`,
-        `/backend-api/files/${encodeURIComponent(fid)}/download`,
-      ];
+    async function resolveImageEndpoint(endpoint, endpointNumber, scoped) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        resolutionDiagnostics.attempts++;
+        resolutionDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
+        if (scoped) {
+          resolutionDiagnostics.scoped_attempts++;
+          resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_attempts`]++;
+        }
 
-      for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
-        const endpoint = endpoints[endpointIndex];
-        const endpointNumber = endpointIndex + 1;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          resolutionDiagnostics.attempts++;
-          resolutionDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
-          try {
-            const response = await fetchWithTimeout(endpoint, auth, 20000);
+        try {
+          const response = await fetchWithTimeout(endpoint, auth, 20000);
 
-            if (!response.ok) {
-              const transient = response.status === 429 || response.status >= 500;
-              if (transient && attempt < 2) {
-                const retryAfter = Number(response.headers.get("retry-after")) || 0;
-                resolutionDiagnostics.retries++;
-                await sleep(Math.min((retryAfter || 2) * 1000 * (attempt + 1), 10000));
-                continue;
-              }
-
-              recordResolverHTTP(response.status, endpointNumber);
-              break;
+          if (!response.ok) {
+            const transient = response.status === 429 || response.status >= 500;
+            if (transient && attempt < 2) {
+              const retryAfter = Number(response.headers.get("retry-after")) || 0;
+              resolutionDiagnostics.retries++;
+              await sleep(Math.min((retryAfter || 2) * 1000 * (attempt + 1), 10000));
+              continue;
             }
 
-            const contentType = (response.headers.get("content-type") || "").toLowerCase();
+            recordResolverHTTP(response.status, endpointNumber);
+            if (scoped && response.status === 403) {
+              resolutionDiagnostics.scoped_http_403++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_http_403`]++;
+            }
+            return { image: null, terminal: response.status === 403 ? "http_403" : "other" };
+          }
 
-            if (contentType.includes("application/json")) {
-              const payload = await response.json();
-              const url =
-                payload.download_url ||
-                (payload.metadata && payload.metadata.download_url) ||
-                null;
+          const contentType = (response.headers.get("content-type") || "").toLowerCase();
 
-              if (!url) {
-                resolutionDiagnostics.json_no_url++;
-                resolutionDiagnostics[`endpoint_${endpointNumber}_json_no_url`]++;
-                break;
-              }
+          if (contentType.includes("application/json")) {
+            const payload = await response.json();
+            const url =
+              payload.download_url ||
+              (payload.metadata && payload.metadata.download_url) ||
+              null;
 
-              resolutionDiagnostics.success_json++;
-              resolutionDiagnostics.resolved++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_success_json`]++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
-              return {
-                fileId: fid,
+            if (!url) {
+              resolutionDiagnostics.json_no_url++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_json_no_url`]++;
+              return { image: null, terminal: "other" };
+            }
+
+            resolutionDiagnostics.success_json++;
+            resolutionDiagnostics.resolved++;
+            resolutionDiagnostics[`endpoint_${endpointNumber}_success_json`]++;
+            resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
+            if (scoped) {
+              resolutionDiagnostics.scoped_resolved++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_resolved`]++;
+            }
+            return {
+              image: {
                 url,
                 mime:
                   (payload.metadata && payload.metadata.mime_type) ||
@@ -377,43 +391,85 @@ async function pageExport(includeImages, includeAttachments) {
                   (payload.metadata && payload.metadata.file_name) ||
                   payload.file_name ||
                   null,
-              };
+              },
+              terminal: "success",
+            };
+          }
+
+          // A successful non-HTML response is usable even when ChatGPT labels
+          // it as application/octet-stream or omits an image MIME type.
+          if (response.redirected || !contentType.includes("text/html")) {
+            try {
+              if (response.body) response.body.cancel();
+            } catch (_) {}
+
+            resolutionDiagnostics.success_response++;
+            resolutionDiagnostics.resolved++;
+            resolutionDiagnostics[`endpoint_${endpointNumber}_success_response`]++;
+            resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
+            if (scoped) {
+              resolutionDiagnostics.scoped_resolved++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_resolved`]++;
             }
-
-            // A successful non-HTML response is usable even when ChatGPT labels
-            // it as application/octet-stream or omits an image MIME type.
-            if (response.redirected || !contentType.includes("text/html")) {
-              try {
-                if (response.body) response.body.cancel();
-              } catch (_) {}
-
-              resolutionDiagnostics.success_response++;
-              resolutionDiagnostics.resolved++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_success_response`]++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
-              return {
-                fileId: fid,
+            return {
+              image: {
                 url: response.url || endpoint,
                 mime: contentType || null,
                 originalName: null,
-              };
-            }
-
-            resolutionDiagnostics.html_rejected++;
-            resolutionDiagnostics[`endpoint_${endpointNumber}_html_rejected`]++;
-            break;
-          } catch (error) {
-            const key = error && error.name === "AbortError" ? "timeout" : "network";
-            resolutionDiagnostics[key]++;
-            resolutionDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
-
-            if (attempt < 1) {
-              resolutionDiagnostics.retries++;
-              await sleep(1000);
-              continue;
-            }
-            break;
+              },
+              terminal: "success",
+            };
           }
+
+          resolutionDiagnostics.html_rejected++;
+          resolutionDiagnostics[`endpoint_${endpointNumber}_html_rejected`]++;
+          return { image: null, terminal: "other" };
+        } catch (error) {
+          const key = error && error.name === "AbortError" ? "timeout" : "network";
+          resolutionDiagnostics[key]++;
+          resolutionDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
+
+          if (attempt < 1) {
+            resolutionDiagnostics.retries++;
+            await sleep(1000);
+            continue;
+          }
+          return { image: null, terminal: "other" };
+        }
+      }
+
+      return { image: null, terminal: "other" };
+    }
+
+    async function resolveImage(fid) {
+      const unscopedEndpoints = [
+        `/backend-api/files/download/${encodeURIComponent(fid)}`,
+        `/backend-api/files/${encodeURIComponent(fid)}/download`,
+      ];
+      const unscopedTerminalOutcomes = [];
+
+      for (let endpointIndex = 0; endpointIndex < unscopedEndpoints.length; endpointIndex++) {
+        const outcome = await resolveImageEndpoint(unscopedEndpoints[endpointIndex], endpointIndex + 1, false);
+        if (outcome.image) return { fileId: fid, ...outcome.image };
+        unscopedTerminalOutcomes.push(outcome.terminal);
+      }
+
+      // Preserve the proven fast path for normal images. Only assets that are
+      // rejected with 403 by BOTH legacy endpoint shapes are retried with the
+      // conversation scope that ChatGPT requires for some conversation files.
+      if (
+        unscopedTerminalOutcomes.length === 2 &&
+        unscopedTerminalOutcomes.every((outcome) => outcome === "http_403")
+      ) {
+        const encodedConversationId = encodeURIComponent(convId);
+        const scopedEndpoints = [
+          `/backend-api/files/download/${encodeURIComponent(fid)}?conversation_id=${encodedConversationId}&inline=false`,
+          `/backend-api/files/${encodeURIComponent(fid)}/download?conversation_id=${encodedConversationId}&inline=false`,
+        ];
+
+        for (let endpointIndex = 0; endpointIndex < scopedEndpoints.length; endpointIndex++) {
+          const outcome = await resolveImageEndpoint(scopedEndpoints[endpointIndex], endpointIndex + 1, true);
+          if (outcome.image) return { fileId: fid, ...outcome.image };
         }
       }
 
