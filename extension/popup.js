@@ -8,6 +8,7 @@ const IMAGE_HOST_PERMISSIONS = [
   "https://chatgpt.com/*",
   "https://*.oaiusercontent.com/*",
 ];
+const ZIP_TRANSFER_CHUNK_BYTES = 8 * 1024 * 1024;
 
 function setStatus(message, kind = "") {
   statusEl.textContent = message;
@@ -24,19 +25,112 @@ async function getActiveChatTab() {
   return tab;
 }
 
-function downloadMarkdownInPage(filename, markdown) {
-  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.rel = "noopener";
-  a.style.display = "none";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 30000);
+function downloadFileInPage(filename, content, mimeType) {
+  const transferKey = "__chatgptExporterZipTransfer";
+  const transfer = content === null ? globalThis[transferKey] : null;
+  if (content === null && !transfer) throw new Error("The ZIP data is no longer available.");
+
+  let objectURL = null;
+  try {
+    const blob = transfer
+      ? new Blob(transfer.parts, { type: transfer.mimeType })
+      : new Blob([content], { type: mimeType });
+    objectURL = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectURL;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    try {
+      anchor.click();
+    } finally {
+      anchor.remove();
+    }
+    return true;
+  } finally {
+    if (transfer) {
+      transfer.parts.length = 0;
+      delete globalThis[transferKey];
+    }
+    if (objectURL) setTimeout(() => URL.revokeObjectURL(objectURL), 60000);
+  }
+}
+
+function beginZipDownloadInPage(mimeType) {
+  const transferKey = "__chatgptExporterZipTransfer";
+  if (globalThis[transferKey]) throw new Error("A ZIP download is already being prepared.");
+  globalThis[transferKey] = { mimeType, parts: [] };
   return true;
+}
+
+function appendZipDownloadChunkInPage(base64Chunk) {
+  const transfer = globalThis.__chatgptExporterZipTransfer;
+  if (!transfer || typeof base64Chunk !== "string") throw new Error("The ZIP transfer is not available.");
+  const binary = atob(base64Chunk);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  transfer.parts.push(bytes);
+  return bytes.length;
+}
+
+function cancelZipDownloadInPage() {
+  const transfer = globalThis.__chatgptExporterZipTransfer;
+  if (transfer) transfer.parts.length = 0;
+  delete globalThis.__chatgptExporterZipTransfer;
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const blockSize = 0x4000;
+  for (let offset = 0; offset < bytes.length; offset += blockSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + blockSize));
+  }
+  return btoa(binary);
+}
+
+async function downloadZipFromPopup(tabId, filename, blob) {
+  const target = { tabId };
+  const mimeType = blob.type || "application/zip";
+  let transferStarted = false;
+  try {
+    // executeScript arguments must be JSON-serializable; transfer bounded slices
+    // instead of serializing the complete ZIP or attempting to pass a Blob.
+    await browser.scripting.executeScript({
+      target,
+      func: beginZipDownloadInPage,
+      args: [mimeType],
+    });
+    transferStarted = true;
+
+    for (let offset = 0; offset < blob.size; offset += ZIP_TRANSFER_CHUNK_BYTES) {
+      const end = Math.min(offset + ZIP_TRANSFER_CHUNK_BYTES, blob.size);
+      const chunkBytes = new Uint8Array(await blob.slice(offset, end).arrayBuffer());
+      const encodedChunk = bytesToBase64(chunkBytes);
+      await browser.scripting.executeScript({
+        target,
+        func: appendZipDownloadChunkInPage,
+        args: [encodedChunk],
+      });
+    }
+
+    const [injection] = await browser.scripting.executeScript({
+      target,
+      func: downloadFileInPage,
+      args: [filename, null, mimeType],
+    });
+    if (!injection || injection.result !== true) throw new Error("Safari did not start the ZIP download.");
+    transferStarted = false;
+    return true;
+  } finally {
+    if (transferStarted) {
+      try {
+        await browser.scripting.executeScript({ target, func: cancelZipDownloadInPage });
+      } catch (_) {
+        // The page may have navigated or lost access while the transfer was in progress.
+      }
+    }
+  }
 }
 
 function requestFileHostPermissionFromGesture() {
@@ -579,34 +673,6 @@ function excludeSuccessfulPDFPreviews(images, downloadedAttachments) {
   return { images: remaining, skipped };
 }
 
-function downloadBlobFromPopup(filename, blob) {
-  // Safari has been observed to name popup-originated Blob downloads "Unknown".
-  // Wrap the ZIP Blob in a File so both the object URL and the anchor carry the
-  // intended filename and application/zip MIME type.
-  let downloadable = blob;
-  try {
-    downloadable = new File([blob], filename, {
-      type: "application/zip",
-      lastModified: Date.now(),
-    });
-  } catch (_) {
-    // Older engines can fall back to the Blob + download attribute path.
-  }
-
-  const url = URL.createObjectURL(downloadable);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.rel = "noopener";
-  a.type = "application/zip";
-  a.style.display = "none";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
-}
-
 async function exportConversation(includeImages, includeAttachments, permissionPromise) {
 
   downloadBtn.disabled = true;
@@ -679,8 +745,8 @@ async function exportConversation(includeImages, includeAttachments, permissionP
       try {
         await browser.scripting.executeScript({
           target: { tabId: tab.id },
-          func: downloadMarkdownInPage,
-          args: [filename, markdown],
+          func: downloadFileInPage,
+          args: [filename, markdown, "text/markdown;charset=utf-8"],
         });
       } catch (e) {
         setStatus("Safari could not start the file download: " + errMsg(e), "err");
@@ -713,7 +779,7 @@ async function exportConversation(includeImages, includeAttachments, permissionP
           data: new TextEncoder().encode(report),
         },
       ];
-      downloadBlobFromPopup(filename, buildZipBlob(entries, base));
+      await downloadZipFromPopup(tab.id, filename, buildZipBlob(entries, base));
       setStatus("✓ ZIP requested. No exportable images were found in this chat.", "ok");
       return;
     }
@@ -744,7 +810,7 @@ async function exportConversation(includeImages, includeAttachments, permissionP
     const filename = exportFilename(result.title, "zip");
     const zipBlob = buildZipBlob(entries, base);
 
-    downloadBlobFromPopup(filename, zipBlob);
+    await downloadZipFromPopup(tab.id, filename, zipBlob);
 
     const downloaded = [...fetched.files.values()].filter(Boolean).length;
     if (fetched.failed || fetchedAttachments.failed) {

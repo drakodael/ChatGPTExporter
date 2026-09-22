@@ -5,18 +5,38 @@ const test = require('node:test');
 
 const source = fs.readFileSync('extension/popup.js', 'utf8');
 const coreSource = fs.readFileSync('extension/export-core.js', 'utf8');
+const manifestSource = fs.readFileSync('extension/manifest.json', 'utf8');
 
 function loadHelpers(fetchImpl) {
   const elements = new Map();
+  const downloadNames = [];
+  const injectedCalls = [];
+  const createdBlobs = [];
+  const revokedUrls = [];
+  const storageAccesses = [];
+  class TestURL extends URL {}
+  TestURL.createObjectURL = (blob) => {
+    const url = URL.createObjectURL(blob);
+    createdBlobs.push({ url, blob });
+    return url;
+  };
+  TestURL.revokeObjectURL = (url) => {
+    revokedUrls.push(url);
+    URL.revokeObjectURL(url);
+  };
   const context = {
     document: {
       getElementById: (id) => {
         if (!elements.has(id)) elements.set(id, { textContent: '', className: '', checked: false, addEventListener() {} });
         return elements.get(id);
       },
+      createElement: () => ({ style: {}, click() { downloadNames.push(this.download); }, remove() {} }),
+      body: { appendChild() {} },
     },
-    URL,
+    URL: TestURL,
     Blob,
+    atob,
+    btoa,
     TextEncoder,
     Uint8Array,
     Uint32Array,
@@ -24,6 +44,18 @@ function loadHelpers(fetchImpl) {
     Map,
     Set,
     Date,
+    setTimeout: (callback) => { callback(); return 0; },
+    browser: {
+      scripting: {
+        executeScript: async (details) => {
+          injectedCalls.push(details);
+          return [{ result: await details.func(...(details.args || [])) }];
+        },
+      },
+      storage: {
+        local: new Proxy({}, { get: (_target, key) => (...args) => storageAccesses.push([key, args]) }),
+      },
+    },
     fetch: fetchImpl || (async () => ({
       ok: true,
       status: 200,
@@ -34,8 +66,8 @@ function loadHelpers(fetchImpl) {
   };
   vm.createContext(context);
   vm.runInContext(coreSource, context);
-  vm.runInContext(`${source}\nthis.testAPI = { safeName, exportFilename: typeof exportFilename === 'undefined' ? null : exportFilename, safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive, buildZipBlob };`, context);
-  return context.testAPI;
+  vm.runInContext(`${source}\nthis.testAPI = { safeName, exportFilename: typeof exportFilename === 'undefined' ? null : exportFilename, safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive, buildZipBlob, downloadFileInPage: typeof downloadFileInPage === 'undefined' ? null : downloadFileInPage, downloadZipFromPopup: typeof downloadZipFromPopup === 'undefined' ? null : downloadZipFromPopup, zipTransferChunkBytes: typeof ZIP_TRANSFER_CHUNK_BYTES === 'undefined' ? null : ZIP_TRANSFER_CHUNK_BYTES, hasPendingZipTransfer: () => Object.prototype.hasOwnProperty.call(globalThis, '__chatgptExporterZipTransfer') };`, context);
+  return Object.assign(context.testAPI, { downloadNames, injectedCalls, createdBlobs, revokedUrls, storageAccesses });
 }
 
 async function readStoredZipEntries(blob) {
@@ -79,6 +111,41 @@ test('conversation title sanitization preserves safe Unicode and replaces filena
   assert.equal([...safeName('é'.repeat(100))].length, 80);
   assert.equal(safeName(`${'x'.repeat(79)}.abc`), 'x'.repeat(79));
   assert.equal(safeName(`${'x'.repeat(79)} abc`), 'x'.repeat(79));
+});
+
+test('ZIP download uses the exact page filename and transient bounded chunks without persisting data', async () => {
+  const helpers = loadHelpers();
+  const { downloadZipFromPopup, zipTransferChunkBytes } = helpers;
+  const bytes = new Uint8Array(zipTransferChunkBytes + 7);
+  for (let index = 0; index < bytes.length; index++) bytes[index] = index % 251;
+  const zipBlob = new Blob([bytes], { type: 'application/zip' });
+
+  await downloadZipFromPopup(42, 'Casos Whatsapp.zip', zipBlob);
+
+  assert.deepEqual(helpers.downloadNames, ['Casos Whatsapp.zip']);
+  assert.doesNotMatch(helpers.downloadNames[0], /Unknown|\d{4}-\d{2}-\d{2}/);
+  assert.ok(helpers.injectedCalls.length >= 4);
+  assert.ok(helpers.injectedCalls.every((call) => call.target.tabId === 42));
+  assert.ok(helpers.injectedCalls.every((call) => !(call.args || []).some((arg) => arg instanceof Blob)));
+  assert.ok(helpers.injectedCalls.every((call) => JSON.stringify(call.args || []).length <= 4 * Math.ceil(zipTransferChunkBytes / 3) + 256));
+  assert.equal(helpers.createdBlobs.length, 1);
+  assert.equal(helpers.createdBlobs[0].blob.size, bytes.length);
+  assert.deepEqual(new Uint8Array(await helpers.createdBlobs[0].blob.arrayBuffer()), bytes);
+  assert.deepEqual(helpers.revokedUrls, [helpers.createdBlobs[0].url]);
+  assert.equal(helpers.hasPendingZipTransfer(), false);
+  assert.deepEqual(helpers.storageAccesses, []);
+});
+
+test('Markdown keeps its exact title filename in the same active-page download helper', () => {
+  const helpers = loadHelpers();
+  helpers.downloadFileInPage('Casos Whatsapp.md', '# Casos Whatsapp', 'text/markdown;charset=utf-8');
+  assert.deepEqual(helpers.downloadNames, ['Casos Whatsapp.md']);
+  assert.doesNotMatch(helpers.downloadNames[0], /Unknown|\d{4}-\d{2}-\d{2}/);
+});
+
+test('normal extension permissions remain exactly activeTab and scripting', () => {
+  const permissions = JSON.parse(manifestSource).permissions.slice().sort();
+  assert.deepEqual(permissions, ['activeTab', 'scripting']);
 });
 
 test('ZIP paths share the sanitized conversation root while Markdown links and attachment names stay relative', async () => {
