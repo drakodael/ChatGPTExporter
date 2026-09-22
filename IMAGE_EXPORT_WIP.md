@@ -209,6 +209,31 @@ unzip -p Unknown export-report.txt
 
 or upload the resulting ZIP for inspection.
 
+### v2.8 — opt-in original attachments
+
+The current `feature/image-export` branch adds an independent **Include original
+attachments** option. With that option selected, original conversation
+attachments are resolved through the active ChatGPT page and saved in
+`attachments/` in the local ZIP. Existing images remain in `images/`; PDF page
+preview pointers associated with a successfully exported original PDF are
+excluded from image download/failure totals. The Markdown links to successfully
+saved attachments use relative paths.
+
+The ZIP report now separates image and attachment detected/downloaded/failed
+counts and uses aggregate failure categories only. No token, signed URL, or file
+ID is written to the report. Normal extension permissions remain exactly
+`activeTab` and `scripting`; optional ChatGPT/OpenAI host access is requested
+only from the user's explicit file-export click. No analytics, extension
+storage, or native messaging was added.
+
+Run the local regression checks with:
+
+```bash
+node --test tests/export-attachments.test.js
+node --check extension/exporter.js
+node --check extension/popup.js
+```
+
 
 ### v2.6 — allow the actual ChatGPT image endpoint
 

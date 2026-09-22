@@ -1,10 +1,8 @@
 // Privacy-focused ChatGPT export parser.
 // Injected only after the user clicks the extension on the active chatgpt.com tab.
-// Same-origin requests read the open conversation. When includeImages=true, only
-// image_asset_pointer entries are resolved; PDFs, generic attachments, raw JSON,
-// sandbox files, Canvas documents, clipboard data, and third-party analytics are
-// deliberately excluded.
-async function pageExport(includeImages) {
+// Attachments are resolved only after an explicit user opt-in. Credentials and
+// signed URLs stay transient and are never included in the archive/report.
+async function pageExport(includeImages, includeAttachments) {
   if (window.__chatgptLocalExporterBusy) {
     return { error: "An export is already running for this chat." };
   }
@@ -107,16 +105,43 @@ async function pageExport(includeImages) {
 
     const imageOrder = [];
     const imageSeen = new Set();
+    const imagePreviewAttachment = new Map();
+    const attachmentOrder = [];
+    const attachmentSeen = new Set();
 
-    function rememberImage(fid) {
+    function rememberImage(fid, previewAttachmentId) {
       if (!fid || imageSeen.has(fid)) return;
       imageSeen.add(fid);
       imageOrder.push(fid);
+      if (previewAttachmentId) imagePreviewAttachment.set(fid, previewAttachmentId);
+    }
+
+    function rememberAttachments(message) {
+      if (!includeAttachments) return;
+      const attachments = (message.metadata && message.metadata.attachments) || [];
+      for (const attachment of attachments) {
+        if (!attachment || typeof attachment !== "object") continue;
+        const pointer = attachment.file_id || attachment.id || attachment.asset_pointer;
+        const fileId = fileIdOf(pointer);
+        if (!fileId || attachmentSeen.has(fileId)) continue;
+        attachmentSeen.add(fileId);
+        attachmentOrder.push({
+          fileId,
+          name: typeof attachment.name === "string" ? attachment.name : "",
+          mime: typeof attachment.mime_type === "string" ? attachment.mime_type : "",
+        });
+      }
     }
 
     function baseText(message) {
       const content = message && message.content;
       if (!content) return "";
+      const pdfAttachments = includeAttachments
+        ? ((message.metadata && message.metadata.attachments) || []).filter((a) => a && /pdf/i.test(a.mime_type || a.name || ""))
+        : [];
+      const previewAttachmentId = pdfAttachments.length
+        ? fileIdOf(pdfAttachments[0].file_id || pdfAttachments[0].id || pdfAttachments[0].asset_pointer)
+        : null;
 
       if (typeof content.text === "string") return content.text;
 
@@ -130,7 +155,7 @@ async function pageExport(includeImages) {
             if (isImagePart(part)) {
               const fid = fileIdOf(part.asset_pointer);
               if (includeImages && fid) {
-                rememberImage(fid);
+                rememberImage(fid, previewAttachmentId);
                 return `@@IMG@@${fid}@@`;
               }
               return "_[image omitted]_";
@@ -193,6 +218,7 @@ async function pageExport(includeImages) {
       if (role !== "user" && role !== "assistant" && !toolImage) continue;
 
       const speaker = role === "user" ? "User" : "ChatGPT";
+      rememberAttachments(msg);
       const text = [renderText(msg), attachmentNote(msg)].filter(Boolean).join("\n\n").trim();
       if (!text) continue;
 
@@ -206,10 +232,7 @@ async function pageExport(includeImages) {
       footnotes: notes,
     };
 
-    if (!includeImages || !imageOrder.length) {
-      if (includeImages) result.images = [];
-      return result;
-    }
+    if (!includeImages && !includeAttachments) return result;
 
     const auth = { headers: { Authorization: `Bearer ${accessToken}` } };
     const resolutionDiagnostics = {
@@ -350,14 +373,72 @@ async function pageExport(includeImages) {
 
     result.images = resolved.map((image, index) => ({
       fileId: image.fileId,
+      previewAttachmentId: imagePreviewAttachment.get(image.fileId) || null,
       url: image.url,
       mime: image.mime,
       name: `image-${String(index + 1).padStart(3, "0")}.${extensionFor(image)}`,
     }));
     result.resolutionDiagnostics = resolutionDiagnostics;
 
-    // Image export only: return the bearer token transiently to the popup so it
-    // can retry OpenAI CDN downloads that reject an otherwise valid signed URL.
+    const attachmentDiagnostics = {
+      resolved: 0, no_url: 0, http_401: 0, http_403: 0, http_404: 0,
+      http_429: 0, http_5xx: 0, http_other: 0, network: 0,
+    };
+    const attachments = [];
+    if (includeAttachments) {
+      for (const attachment of attachmentOrder) {
+        let found = null;
+        const endpoints = [
+          `/backend-api/files/download/${encodeURIComponent(attachment.fileId)}`,
+          `/backend-api/files/${encodeURIComponent(attachment.fileId)}/download`,
+        ];
+        for (const endpoint of endpoints) {
+          try {
+            const response = await fetchWithTimeout(endpoint, auth, 20000);
+            if (!response.ok) {
+              const status = response.status;
+              const key = status === 401 ? "http_401" : status === 403 ? "http_403" : status === 404 ? "http_404" : status === 429 ? "http_429" : status >= 500 ? "http_5xx" : "http_other";
+              attachmentDiagnostics[key]++;
+              continue;
+            }
+            const type = (response.headers.get("content-type") || "").toLowerCase();
+            if (type.includes("application/json")) {
+              const payload = await response.json();
+              const url = payload.download_url || (payload.metadata && payload.metadata.download_url);
+              if (url) {
+                found = {
+                  fileId: attachment.fileId,
+                  url,
+                  name: (payload.metadata && (payload.metadata.file_name || payload.metadata.name)) || payload.file_name || attachment.name,
+                  mime: (payload.metadata && payload.metadata.mime_type) || payload.mime_type || attachment.mime,
+                };
+                break;
+              }
+              attachmentDiagnostics.no_url++;
+            } else if (response.redirected || !type.includes("text/html")) {
+              try { if (response.body) response.body.cancel(); } catch (_) {}
+              found = { ...attachment, url: response.url || endpoint };
+              break;
+            } else {
+              attachmentDiagnostics.no_url++;
+            }
+          } catch (_) {
+            attachmentDiagnostics.network++;
+          }
+        }
+        if (found) {
+          attachmentDiagnostics.resolved++;
+          attachments.push(found);
+        } else {
+          attachments.push({ ...attachment, url: null });
+        }
+      }
+    }
+    result.attachments = attachments;
+    result.attachmentDiagnostics = attachmentDiagnostics;
+
+    // Return the bearer token transiently only for an explicitly requested file
+    // export. Consumers must restrict authenticated requests to OpenAI hosts.
     // The popup never persists, logs, archives, or forwards this token outside
     // approved OpenAI image CDN hosts.
     result.token = accessToken;

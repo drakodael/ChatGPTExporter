@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Local Exporter",
-  "version": "2.7-private",
-  "description": "Export the active ChatGPT conversation to local Markdown, optionally with images in a ZIP. Normal permissions remain activeTab + scripting. Image export requests temporary access only to chatgpt.com and OpenAI image hosts. v2.7 adds more tolerant image resolution, privacy-safe aggregate resolver diagnostics, and a Safari filename workaround using a named File object.",
+  "version": "2.8-private",
+  "description": "Export the active ChatGPT conversation to local Markdown, optionally with images and original attachments in a ZIP. Normal permissions remain activeTab + scripting. File export requests temporary access only to ChatGPT and OpenAI file hosts; tokens and diagnostics remain local and transient.",
   "icons": {
     "48": "images/icon-48.png",
     "96": "images/icon-96.png",

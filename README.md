@@ -72,6 +72,20 @@ A 🟢 button appears in the toolbar.
 
 ## Usage
 
+In the temporary extension, **Include images** and **Include original
+attachments** are independent opt-ins. Either option produces a local ZIP;
+attachments are placed in `attachments/` and images remain in `images/`.
+PDF page previews are not exported as separate images when the original file is
+available as a conversation attachment. `export-report.txt` reports image and
+attachment totals separately and contains aggregate diagnostics only.
+
+The extension keeps normal permissions at `activeTab` + `scripting`. It asks
+for optional OpenAI host access only from the user's export click when either
+file option is selected. Session credentials are transient, used only against
+validated OpenAI hosts, then removed before ZIP/report creation; signed URLs,
+file IDs, analytics, persistent storage, and native messaging are not used by
+this optional file-export path.
+
 1. Open the conversation in Safari (the account that owns the chat).
 2. Click **Download** to write the whole chat as `Title-YYYY-MM-DD-HH-MM.md` to
    your **Downloads** folder, or **Copy** to put the Markdown on the clipboard.

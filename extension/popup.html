@@ -16,9 +16,17 @@
     </span>
   </label>
 
+  <label class="option">
+    <input id="attachments" type="checkbox">
+    <span>
+      <strong>Include original attachments</strong>
+      <small>Optional PDFs and other conversation attachments are saved under attachments/ in the ZIP.</small>
+    </span>
+  </label>
+
   <button id="download" type="button">Export Markdown</button>
 
-  <p class="privacy">Local only · active tab only · image host permission is optional · no analytics · no native app</p>
+  <p class="privacy">Local only · opt-in files · no saved tokens or analytics · no native messaging</p>
   <p id="status" class="muted">Open a ChatGPT conversation and export it locally.</p>
 
   <script src="exporter.js"></script>

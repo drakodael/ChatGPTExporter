@@ -1,6 +1,7 @@
 const statusEl = document.getElementById("status");
 const downloadBtn = document.getElementById("download");
 const imagesToggle = document.getElementById("images");
+const attachmentsToggle = document.getElementById("attachments");
 
 const CHATGPT_URL = /^https:\/\/chatgpt\.com\//;
 const IMAGE_HOST_PERMISSIONS = [
@@ -38,7 +39,7 @@ function downloadMarkdownInPage(filename, markdown) {
   return true;
 }
 
-function requestImageCDNPermissionFromGesture() {
+function requestFileHostPermissionFromGesture() {
   // Safari requires permissions.request() to be invoked synchronously from
   // the user's click handler, before any await or other async boundary.
   return browser.permissions.request({
@@ -77,6 +78,22 @@ function extensionFromContentType(contentType, fallbackName) {
   }
 
   return "png";
+}
+
+function safeAttachmentName(name, index, mime) {
+  const basename = String(name || "")
+    .replace(/\\/g, "/")
+    .split("/").pop()
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+    .replace(/^\.+/, "")
+    .trim()
+    .slice(0, 120);
+  const mimeExt = /pdf/i.test(mime || "") ? "pdf" : "bin";
+  const safe = basename || `attachment-${String(index).padStart(3, "0")}.${mimeExt}`;
+  const ext = safe.match(/\.([A-Za-z0-9]{1,8})$/);
+  const allowed = new Set(["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip", "json", "png", "jpg", "jpeg", "webp", "gif", "bin"]);
+  if (!ext || !allowed.has(ext[1].toLowerCase())) return `${safe.replace(/\.[^.]*$/, "") || `attachment-${String(index).padStart(3, "0")}`}.${mimeExt}`;
+  return safe;
 }
 
 function crc32(bytes) {
@@ -327,6 +344,67 @@ async function fetchImagesForArchive(images, accessToken) {
   return { files, failed, diagnostics };
 }
 
+async function fetchAttachmentsForArchive(attachments, accessToken) {
+  const files = [];
+  const diagnostics = { direct_ok: 0, auth_ok: 0, no_url: 0, invalid_host: 0, content_type: 0, network: 0, http_401: 0, http_403: 0, http_404: 0, http_429: 0, http_5xx: 0, http_other: 0 };
+  let failed = 0;
+  for (let index = 0; index < (attachments || []).length; index++) {
+    const attachment = attachments[index];
+    setStatus(`Downloading attachment ${index + 1} of ${attachments.length}…`);
+    if (!attachment || !attachment.url) { diagnostics.no_url++; failed++; continue; }
+    if (!isAllowedImageURL(attachment.url)) { diagnostics.invalid_host++; failed++; continue; }
+    const attempt = async (token) => {
+      try {
+        const response = await fetch(attachment.url, {
+          method: "GET", headers: token ? { Authorization: `Bearer ${token}` } : {},
+          credentials: "omit", cache: "no-store", redirect: "follow",
+        });
+        if (!response.ok) return { reason: "http", status: response.status };
+        const contentType = response.headers.get("content-type") || attachment.mime || "application/octet-stream";
+        if (/text\/html/i.test(contentType)) return { reason: "content_type" };
+        return { bytes: new Uint8Array(await response.arrayBuffer()), contentType };
+      } catch (_) { return { reason: "network" }; }
+    };
+    let outcome = await attempt(null);
+    let usedAuth = false;
+    if (outcome.reason && accessToken) { outcome = await attempt(accessToken); usedAuth = !outcome.reason; }
+    if (outcome.reason) {
+      failed++;
+      if (outcome.reason === "http") {
+        const status = outcome.status;
+        const key = status === 401 ? "http_401" : status === 403 ? "http_403" : status === 404 ? "http_404" : status === 429 ? "http_429" : status >= 500 ? "http_5xx" : "http_other";
+        diagnostics[key]++;
+      } else diagnostics[outcome.reason]++;
+      continue;
+    }
+    const name = safeAttachmentName(attachment.name, index + 1, outcome.contentType || attachment.mime);
+    files.push({ fileId: attachment.fileId, name, bytes: outcome.bytes });
+    diagnostics[usedAuth ? "auth_ok" : "direct_ok"]++;
+  }
+  return { files, failed, diagnostics };
+}
+
+function buildExportReport(imageResult, attachmentResult, hadToken) {
+  const images = imageResult || {};
+  const attachments = attachmentResult || {};
+  return [
+    "ChatGPT Local Exporter - file export report", "Version: 2.8-private", "",
+    `Images detected: ${images.detected || 0}`,
+    `Images downloaded: ${images.downloaded || 0}`,
+    `Images failed: ${images.failed || 0}`, "",
+    "Image failure categories (aggregate only):",
+    ...["no_url", "invalid_host", "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other", "content_type", "network"].map((key) => `image-${key}: ${(images.diagnostics && images.diagnostics[key]) || 0}`), "",
+    `Attachments detected: ${attachments.detected || 0}`,
+    `Attachments downloaded: ${attachments.downloaded || 0}`,
+    `Attachments failed: ${attachments.failed || 0}`,
+    `Attachment direct downloads: ${(attachments.diagnostics && attachments.diagnostics.direct_ok) || 0}`,
+    `Attachment authenticated downloads: ${(attachments.diagnostics && attachments.diagnostics.auth_ok) || 0}`,
+    `Transient session token available: ${hadToken ? "yes" : "no"}`, "",
+    "Attachment failure categories:", ...["no_url", "invalid_host", "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other", "content_type", "network"].map((key) => `${key}: ${(attachments.diagnostics && attachments.diagnostics[key]) || 0}`), "",
+    "Privacy:", "- Aggregate counts only; no token, signed URL, or file ID is included.", "",
+  ].join("\n");
+}
+
 function buildImageExportReport(images, fetched, hadToken, resolutionDiagnostics) {
   const d = (fetched && fetched.diagnostics) || {};
   const detected = Array.isArray(images) ? images.length : 0;
@@ -430,6 +508,69 @@ function buildArchiveMarkdown(markdownTemplate, images, fetched) {
   return entries;
 }
 
+function uniqueAttachmentArchiveNames(attachments) {
+  const usedNames = new Set();
+  const names = new Map();
+  for (const attachment of attachments || []) {
+    if (!attachment || !attachment.bytes) continue;
+    const original = attachment.name;
+    const dot = original.lastIndexOf(".");
+    const stem = dot > 0 ? original.slice(0, dot) : original;
+    const ext = dot > 0 ? original.slice(dot) : "";
+    let name = original;
+    let suffix = 2;
+    while (usedNames.has(name)) name = `${stem}-${suffix++}${ext}`;
+    usedNames.add(name);
+    names.set(attachment.fileId, name);
+  }
+  return names;
+}
+
+function addAttachmentsToArchive(entries, attachments) {
+  const names = uniqueAttachmentArchiveNames(attachments);
+  for (const attachment of attachments || []) {
+    const name = names.get(attachment && attachment.fileId);
+    if (name) entries.push({ name: `attachments/${name}`, data: attachment.bytes });
+  }
+}
+
+function linkDownloadedAttachments(markdown, descriptors, files) {
+  const byId = new Map((files || []).map((file) => [file.fileId, file]));
+  const archiveNames = uniqueAttachmentArchiveNames(files);
+  let output = markdown;
+  for (const descriptor of descriptors || []) {
+    const file = byId.get(descriptor.fileId);
+    if (!file) continue;
+    const label = descriptor.name || file.name;
+    const archiveName = archiveNames.get(file.fileId) || file.name;
+    output = replaceAllLiteral(output, `_[attachment omitted: ${label}]_`, `[${label.replace(/\]/g, "\\]")}](attachments/${archiveName})`);
+  }
+  return output;
+}
+
+function markSkippedPDFPreviews(markdown, skipped, downloadedAttachments) {
+  const files = new Map((downloadedAttachments || []).map((file) => [file.fileId, file]));
+  let output = markdown;
+  for (const image of skipped || []) {
+    const attachment = files.get(image.previewAttachmentId);
+    if (!attachment) continue;
+    const token = `@@IMG@@${image.fileId}@@`;
+    output = replaceAllLiteral(output, token, `_[PDF page preview omitted; original PDF: ${attachment.name}]_`);
+  }
+  return output;
+}
+
+function excludeSuccessfulPDFPreviews(images, downloadedAttachments) {
+  const downloadedIds = new Set((downloadedAttachments || []).map((file) => file && file.fileId).filter(Boolean));
+  const skipped = [];
+  const remaining = [];
+  for (const image of images || []) {
+    if (image && image.previewAttachmentId && downloadedIds.has(image.previewAttachmentId)) skipped.push(image);
+    else remaining.push(image);
+  }
+  return { images: remaining, skipped };
+}
+
 function downloadBlobFromPopup(filename, blob) {
   // Safari has been observed to name popup-originated Blob downloads "Unknown".
   // Wrap the ZIP Blob in a File so both the object URL and the anchor carry the
@@ -458,10 +599,11 @@ function downloadBlobFromPopup(filename, blob) {
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
-async function exportConversation(includeImages, permissionPromise) {
+async function exportConversation(includeImages, includeAttachments, permissionPromise) {
 
   downloadBtn.disabled = true;
-  imagesToggle.disabled = true;
+    imagesToggle.disabled = true;
+    attachmentsToggle.disabled = true;
 
   try {
     const tab = await getActiveChatTab();
@@ -470,15 +612,15 @@ async function exportConversation(includeImages, permissionPromise) {
       return;
     }
 
-    if (includeImages) {
-      setStatus("Requesting access to ChatGPT image hosts…");
+    if (includeImages || includeAttachments) {
+      setStatus("Requesting temporary access to OpenAI file hosts…");
 
       let granted = false;
       try {
         granted = !!(await permissionPromise);
       } catch (e) {
         setStatus(
-          "Safari could not request image CDN access: " + errMsg(e),
+          "Safari could not request temporary file access: " + errMsg(e),
           "err"
         );
         return;
@@ -486,7 +628,7 @@ async function exportConversation(includeImages, permissionPromise) {
 
       if (!granted) {
         setStatus(
-          "Image export was cancelled because Safari did not grant access to the ChatGPT image hosts.",
+          "File export was cancelled because Safari did not grant access to the required OpenAI hosts.",
           "err"
         );
         return;
@@ -500,7 +642,7 @@ async function exportConversation(includeImages, permissionPromise) {
       [injection] = await browser.scripting.executeScript({
         target: { tabId: tab.id },
         func: pageExport,
-        args: [includeImages],
+        args: [includeImages, includeAttachments],
       });
     } catch (_) {
       setStatus(
@@ -523,7 +665,7 @@ async function exportConversation(includeImages, permissionPromise) {
     const markdown = buildMarkdown(result);
     const base = `${safeName(result.title)}-${timestamp()}`;
 
-    if (!includeImages) {
+    if (!includeImages && !includeAttachments) {
       const filename = `${base}.md`;
 
       try {
@@ -542,14 +684,17 @@ async function exportConversation(includeImages, permissionPromise) {
     }
 
     const images = result.images || [];
-    if (!images.length) {
+    const attachmentDescriptors = result.attachments || [];
+    const accessToken = typeof result.token === "string" ? result.token : null;
+    delete result.token;
+    if (!images.length && !attachmentDescriptors.length) {
       const filename = `${base}.zip`;
       const emptyFetched = {
         files: new Map(),
         failed: 0,
         diagnostics: {},
       };
-      const report = buildImageExportReport(images, emptyFetched, false, {});
+      const report = buildExportReport({ detected: 0, downloaded: 0, failed: 0 }, { detected: 0, downloaded: 0, failed: 0 }, false);
       const entries = [
         {
           name: "conversation.md",
@@ -568,14 +713,21 @@ async function exportConversation(includeImages, permissionPromise) {
     // Keep the bearer token only in a local variable for the duration of image
     // fetching. Remove it from the result object immediately so it cannot be
     // accidentally included in later processing.
-    const accessToken = typeof result.token === "string" ? result.token : null;
-    delete result.token;
-
-    const fetched = await fetchImagesForArchive(images, accessToken);
+    const fetchedAttachments = await fetchAttachmentsForArchive(attachmentDescriptors, accessToken);
+    const imageSelection = excludeSuccessfulPDFPreviews(images, fetchedAttachments.files);
+    const fetched = await fetchImagesForArchive(imageSelection.images, accessToken);
     setStatus("Building ZIP locally…");
 
-    const entries = buildArchiveMarkdown(markdown, images, fetched);
-    const report = buildImageExportReport(images, fetched, !!accessToken, result.resolutionDiagnostics || {});
+    const linkedMarkdown = linkDownloadedAttachments(markdown, attachmentDescriptors, fetchedAttachments.files);
+    const attachmentMarkdown = markSkippedPDFPreviews(linkedMarkdown, imageSelection.skipped, fetchedAttachments.files);
+    const entries = buildArchiveMarkdown(attachmentMarkdown, imageSelection.images, fetched);
+    addAttachmentsToArchive(entries, fetchedAttachments.files);
+    const imageDownloaded = [...fetched.files.values()].filter(Boolean).length;
+    const report = buildExportReport(
+      { detected: images.length - imageSelection.skipped.length, downloaded: imageDownloaded, failed: fetched.failed, diagnostics: fetched.diagnostics },
+      { detected: attachmentDescriptors.length, downloaded: fetchedAttachments.files.length, failed: fetchedAttachments.failed, diagnostics: fetchedAttachments.diagnostics },
+      !!accessToken
+    );
     entries.push({
       name: "export-report.txt",
       data: new TextEncoder().encode(report),
@@ -587,7 +739,7 @@ async function exportConversation(includeImages, permissionPromise) {
     downloadBlobFromPopup(filename, zipBlob);
 
     const downloaded = [...fetched.files.values()].filter(Boolean).length;
-    if (fetched.failed) {
+    if (fetched.failed || fetchedAttachments.failed) {
       const d = fetched.diagnostics || {};
       const reasons = [];
 
@@ -603,8 +755,8 @@ async function exportConversation(includeImages, permissionPromise) {
       if (d.network) reasons.push(`network:${d.network}`);
 
       setStatus(
-        `✓ ZIP requested with ${downloaded} image${downloaded === 1 ? "" : "s"}; ` +
-        `${fetched.failed} failed` +
+        `✓ ZIP requested: ${downloaded} image${downloaded === 1 ? "" : "s"}, ${fetchedAttachments.files.length} attachment${fetchedAttachments.files.length === 1 ? "" : "s"}; ` +
+        `${fetched.failed + fetchedAttachments.failed} failed` +
         (reasons.length ? ` (${reasons.join(", ")})` : "") +
         `. Authenticated downloads: ${d.auth_ok || 0}.`,
         "ok"
@@ -612,7 +764,7 @@ async function exportConversation(includeImages, permissionPromise) {
     } else {
       const authCount = (fetched.diagnostics && fetched.diagnostics.auth_ok) || 0;
       setStatus(
-        `✓ ZIP requested with ${downloaded} image${downloaded === 1 ? "" : "s"}. ` +
+        `✓ ZIP requested: ${downloaded} image${downloaded === 1 ? "" : "s"}, ${fetchedAttachments.files.length} attachment${fetchedAttachments.files.length === 1 ? "" : "s"}. ` +
         `Authenticated downloads: ${authCount}.`,
         "ok"
       );
@@ -622,34 +774,37 @@ async function exportConversation(includeImages, permissionPromise) {
   } finally {
     downloadBtn.disabled = false;
     imagesToggle.disabled = false;
+    attachmentsToggle.disabled = false;
   }
 }
 
 function refreshButtonLabel() {
-  downloadBtn.textContent = imagesToggle.checked ? "Export ZIP" : "Export Markdown";
+  downloadBtn.textContent = imagesToggle.checked || attachmentsToggle.checked ? "Export ZIP" : "Export Markdown";
 }
 
 imagesToggle.addEventListener("change", refreshButtonLabel);
+attachmentsToggle.addEventListener("change", refreshButtonLabel);
 
 downloadBtn.addEventListener("click", () => {
   const includeImages = imagesToggle.checked;
+  const includeAttachments = attachmentsToggle.checked;
 
   // IMPORTANT: this call must happen synchronously during the click.
   let permissionPromise = Promise.resolve(true);
 
-  if (includeImages) {
+  if (includeImages || includeAttachments) {
     try {
-      permissionPromise = requestImageCDNPermissionFromGesture();
+      permissionPromise = requestFileHostPermissionFromGesture();
     } catch (e) {
       setStatus(
-        "Safari could not start the image permission request: " + errMsg(e),
+        "Safari could not start the file permission request: " + errMsg(e),
         "err"
       );
       return;
     }
   }
 
-  void exportConversation(includeImages, permissionPromise);
+  void exportConversation(includeImages, includeAttachments, permissionPromise);
 });
 
 refreshButtonLabel();
