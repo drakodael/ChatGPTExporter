@@ -485,10 +485,17 @@ async function fetchAttachmentsForArchive(attachments, accessToken) {
   return { files, failed, diagnostics };
 }
 
-function buildExportReport(imageResult, attachmentResult, hadToken, attachmentResolverDiagnostics) {
+function buildExportReport(imageResult, attachmentResult, hadToken, attachmentResolverDiagnostics, imageResolverDiagnostics, imageDiscoveryDiagnostics) {
   const images = imageResult || {};
   const attachments = attachmentResult || {};
   const resolver = attachmentResolverDiagnostics || {};
+  const imageResolver = imageResolverDiagnostics || {};
+  const imageDiscovery = imageDiscoveryDiagnostics || {};
+  const imageResolverOutcomeKeys = [
+    "success_json", "success_response", "json_no_url", "html_rejected",
+    "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other",
+    "network", "timeout",
+  ];
   const resolverOutcomeKeys = [
     "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other",
     "network", "timeout", "json_download_url", "json_metadata_download_url",
@@ -502,6 +509,25 @@ function buildExportReport(imageResult, attachmentResult, hadToken, attachmentRe
     `Images failed: ${images.failed || 0}`, "",
     "Image failure categories (aggregate only):",
     ...["no_url", "invalid_host", "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other", "content_type", "network"].map((key) => `image-${key}: ${(images.diagnostics && images.diagnostics[key]) || 0}`), "",
+    "Image discovery diagnostics (aggregate only):",
+    `image-source-image_asset_pointer: ${imageDiscovery.source_image_asset_pointer || 0}`,
+    `image-pointer-normalized: ${imageDiscovery.pointer_normalized || 0}`,
+    `image-pointer-missing_or_invalid: ${imageDiscovery.pointer_missing_or_invalid || 0}`,
+    `image-unique-discovered: ${imageDiscovery.unique_discovered || 0}`,
+    `image-duplicate-pointer: ${imageDiscovery.duplicate_pointer || 0}`,
+    `image-preview-associated: ${imageDiscovery.preview_associated || 0}`,
+    `image-preview-excluded-as-exported-pdf: ${images.excluded_pdf_previews || 0}`, "",
+    "Image resolver diagnostics (aggregate only):",
+    `image-resolver-attempts: ${imageResolver.attempts || 0}`,
+    `image-resolver-resolved: ${imageResolver.resolved || 0}`,
+    `image-resolver-final_no_url: ${imageResolver.final_no_url || 0}`,
+    `image-resolver-retries: ${imageResolver.retries || 0}`,
+    ...imageResolverOutcomeKeys.map((key) => `image-resolver-${key}: ${imageResolver[key] || 0}`),
+    ...[1, 2].flatMap((endpointNumber) => [
+      `image-resolver-endpoint_${endpointNumber}-attempts: ${imageResolver[`endpoint_${endpointNumber}_attempts`] || 0}`,
+      `image-resolver-endpoint_${endpointNumber}-resolved: ${imageResolver[`endpoint_${endpointNumber}_resolved`] || 0}`,
+      ...imageResolverOutcomeKeys.map((key) => `image-resolver-endpoint_${endpointNumber}-${key}: ${imageResolver[`endpoint_${endpointNumber}_${key}`] || 0}`),
+    ]), "",
     `Attachments detected: ${attachments.detected || 0}`,
     `Attachments downloaded: ${attachments.downloaded || 0}`,
     `Attachments failed: ${attachments.failed || 0}`,
@@ -797,7 +823,14 @@ async function exportConversation(includeImages, includeAttachments, permissionP
         failed: 0,
         diagnostics: {},
       };
-      const report = buildExportReport({ detected: 0, downloaded: 0, failed: 0 }, { detected: 0, downloaded: 0, failed: 0 }, false, result.attachmentResolverDiagnostics);
+      const report = buildExportReport(
+        { detected: 0, downloaded: 0, failed: 0, excluded_pdf_previews: 0 },
+        { detected: 0, downloaded: 0, failed: 0 },
+        false,
+        result.attachmentResolverDiagnostics,
+        result.resolutionDiagnostics,
+        result.imageDiscoveryDiagnostics
+      );
       const entries = [
         {
           name: "conversation.md",
@@ -827,10 +860,18 @@ async function exportConversation(includeImages, includeAttachments, permissionP
     addAttachmentsToArchive(entries, fetchedAttachments.files);
     const imageDownloaded = [...fetched.files.values()].filter(Boolean).length;
     const report = buildExportReport(
-      { detected: images.length - imageSelection.skipped.length, downloaded: imageDownloaded, failed: fetched.failed, diagnostics: fetched.diagnostics },
+      {
+        detected: images.length - imageSelection.skipped.length,
+        downloaded: imageDownloaded,
+        failed: fetched.failed,
+        excluded_pdf_previews: imageSelection.skipped.length,
+        diagnostics: fetched.diagnostics,
+      },
       { detected: attachmentDescriptors.length, downloaded: fetchedAttachments.files.length, failed: fetchedAttachments.failed, diagnostics: fetchedAttachments.diagnostics },
       !!accessToken,
-      result.attachmentResolverDiagnostics
+      result.attachmentResolverDiagnostics,
+      result.resolutionDiagnostics,
+      result.imageDiscoveryDiagnostics
     );
     entries.push({
       name: "export-report.txt",

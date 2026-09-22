@@ -685,3 +685,75 @@ test('page export discovers original PDF metadata and associates its rendered pa
   assert.equal(result.attachments[0].name, 'receipt.pdf');
   assert.equal(result.token, 'transient-secret-token');
 });
+
+
+test('image resolver diagnostics classify unresolved image assets without leaking private values', async () => {
+  const privateImageId = 'private-image-id-do-not-report';
+  const privatePdfId = 'private-pdf-id-do-not-report';
+  const privateSignedPdf = 'https://files.oaiusercontent.com/private-signed-pdf-do-not-report';
+  const harness = createPageExportHarness(
+    { id: privatePdfId, name: 'private-receipt-name.pdf', mime_type: 'application/pdf' },
+    (url, _call, jsonResponse) => {
+      if (url.includes(privateImageId)) return jsonResponse({}, { ok: false, status: 403 });
+      if (url.includes(privatePdfId)) return jsonResponse({ download_url: privateSignedPdf });
+      throw new Error('unexpected resolver request');
+    },
+    privateImageId
+  );
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images.length, 1);
+  assert.equal(result.images[0].url, null);
+  assert.equal(result.imageDiscoveryDiagnostics.source_image_asset_pointer, 1);
+  assert.equal(result.imageDiscoveryDiagnostics.pointer_normalized, 1);
+  assert.equal(result.imageDiscoveryDiagnostics.pointer_missing_or_invalid, 0);
+  assert.equal(result.imageDiscoveryDiagnostics.unique_discovered, 1);
+  assert.equal(result.imageDiscoveryDiagnostics.preview_associated, 1);
+  assert.equal(result.resolutionDiagnostics.attempts, 2);
+  assert.equal(result.resolutionDiagnostics.resolved, 0);
+  assert.equal(result.resolutionDiagnostics.final_no_url, 1);
+  assert.equal(result.resolutionDiagnostics.http_403, 2);
+  assert.equal(result.resolutionDiagnostics.endpoint_1_http_403, 1);
+  assert.equal(result.resolutionDiagnostics.endpoint_2_http_403, 1);
+
+  const report = loadHelpers().buildExportReport(
+    { detected: 1, downloaded: 0, failed: 1, excluded_pdf_previews: 0, diagnostics: { no_url: 1 } },
+    { detected: 1, downloaded: 1, failed: 0, diagnostics: { direct_ok: 1 } },
+    true,
+    result.attachmentResolverDiagnostics,
+    result.resolutionDiagnostics,
+    result.imageDiscoveryDiagnostics
+  );
+  assert.match(report, /image-source-image_asset_pointer: 1/);
+  assert.match(report, /image-resolver-final_no_url: 1/);
+  assert.match(report, /image-resolver-endpoint_1-http_403: 1/);
+  assert.match(report, /image-resolver-endpoint_2-http_403: 1/);
+  for (const secret of [
+    privateImageId,
+    privatePdfId,
+    privateSignedPdf,
+    'private-receipt-name.pdf',
+    'resolver-test-bearer-secret',
+  ]) assert.equal(report.includes(secret), false);
+});
+
+test('file export report distinguishes PDF-preview exclusion from remaining image failures', () => {
+  const report = loadHelpers().buildExportReport(
+    { detected: 135, downloaded: 133, failed: 2, excluded_pdf_previews: 2, diagnostics: { no_url: 2 } },
+    { detected: 1, downloaded: 1, failed: 0, diagnostics: { direct_ok: 1 } },
+    true,
+    {},
+    { attempts: 139, resolved: 135, final_no_url: 2, http_403: 4 },
+    {
+      source_image_asset_pointer: 137,
+      pointer_normalized: 137,
+      unique_discovered: 137,
+      preview_associated: 2,
+    }
+  );
+  assert.match(report, /Images detected: 135/);
+  assert.match(report, /image-preview-excluded-as-exported-pdf: 2/);
+  assert.match(report, /image-unique-discovered: 137/);
+  assert.match(report, /image-resolver-final_no_url: 2/);
+  assert.match(report, /image-no_url: 2/);
+});

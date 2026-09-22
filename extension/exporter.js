@@ -106,6 +106,14 @@ async function pageExport(includeImages, includeAttachments) {
     const imageOrder = [];
     const imageSeen = new Set();
     const imagePreviewAttachment = new Map();
+    const imageDiscoveryDiagnostics = {
+      source_image_asset_pointer: 0,
+      pointer_normalized: 0,
+      pointer_missing_or_invalid: 0,
+      unique_discovered: 0,
+      duplicate_pointer: 0,
+      preview_associated: 0,
+    };
     const attachmentOrder = [];
     const attachmentSeen = new Set();
     const attachmentIdSourceDiagnostics = {
@@ -135,10 +143,18 @@ async function pageExport(includeImages, includeAttachments) {
     }
 
     function rememberImage(fid, previewAttachmentId) {
-      if (!fid || imageSeen.has(fid)) return;
+      if (!fid) return;
+      if (imageSeen.has(fid)) {
+        imageDiscoveryDiagnostics.duplicate_pointer++;
+        return;
+      }
       imageSeen.add(fid);
       imageOrder.push(fid);
-      if (previewAttachmentId) imagePreviewAttachment.set(fid, previewAttachmentId);
+      imageDiscoveryDiagnostics.unique_discovered++;
+      if (previewAttachmentId) {
+        imagePreviewAttachment.set(fid, previewAttachmentId);
+        imageDiscoveryDiagnostics.preview_associated++;
+      }
     }
 
     function rememberAttachments(message) {
@@ -183,6 +199,11 @@ async function pageExport(includeImages, includeAttachments) {
 
             if (isImagePart(part)) {
               const fid = fileIdOf(part.asset_pointer);
+              if (includeImages) {
+                imageDiscoveryDiagnostics.source_image_asset_pointer++;
+                if (fid) imageDiscoveryDiagnostics.pointer_normalized++;
+                else imageDiscoveryDiagnostics.pointer_missing_or_invalid++;
+              }
               if (includeImages && fid) {
                 rememberImage(fid, previewAttachmentId);
                 return `@@IMG@@${fid}@@`;
@@ -264,30 +285,38 @@ async function pageExport(includeImages, includeAttachments) {
     if (!includeImages && !includeAttachments) return result;
 
     const auth = { headers: { Authorization: `Bearer ${accessToken}` } };
+    const imageResolverOutcomeKeys = [
+      "success_json", "success_response", "json_no_url", "html_rejected",
+      "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other",
+      "network", "timeout",
+    ];
     const resolutionDiagnostics = {
-      success_json: 0,
-      success_response: 0,
-      json_no_url: 0,
-      html_rejected: 0,
-      http_401: 0,
-      http_403: 0,
-      http_404: 0,
-      http_429: 0,
-      http_5xx: 0,
-      http_other: 0,
-      network: 0,
+      attempts: 0,
+      resolved: 0,
+      final_no_url: 0,
       retries: 0,
+      ...Object.fromEntries(imageResolverOutcomeKeys.map((key) => [key, 0])),
+      endpoint_1_attempts: 0,
+      endpoint_2_attempts: 0,
+      endpoint_1_resolved: 0,
+      endpoint_2_resolved: 0,
+      ...Object.fromEntries([1, 2].flatMap((endpointNumber) =>
+        imageResolverOutcomeKeys.map((key) => [`endpoint_${endpointNumber}_${key}`, 0])
+      )),
     };
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    function recordResolverHTTP(status) {
-      if (status === 401) resolutionDiagnostics.http_401++;
-      else if (status === 403) resolutionDiagnostics.http_403++;
-      else if (status === 404) resolutionDiagnostics.http_404++;
-      else if (status === 429) resolutionDiagnostics.http_429++;
-      else if (status >= 500) resolutionDiagnostics.http_5xx++;
-      else resolutionDiagnostics.http_other++;
+    function recordResolverHTTP(status, endpointNumber) {
+      const key =
+        status === 401 ? "http_401" :
+        status === 403 ? "http_403" :
+        status === 404 ? "http_404" :
+        status === 429 ? "http_429" :
+        status >= 500 ? "http_5xx" :
+        "http_other";
+      resolutionDiagnostics[key]++;
+      resolutionDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
     }
 
     async function resolveImage(fid) {
@@ -296,8 +325,12 @@ async function pageExport(includeImages, includeAttachments) {
         `/backend-api/files/${encodeURIComponent(fid)}/download`,
       ];
 
-      for (const endpoint of endpoints) {
+      for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
+        const endpoint = endpoints[endpointIndex];
+        const endpointNumber = endpointIndex + 1;
         for (let attempt = 0; attempt < 3; attempt++) {
+          resolutionDiagnostics.attempts++;
+          resolutionDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
           try {
             const response = await fetchWithTimeout(endpoint, auth, 20000);
 
@@ -310,7 +343,7 @@ async function pageExport(includeImages, includeAttachments) {
                 continue;
               }
 
-              recordResolverHTTP(response.status);
+              recordResolverHTTP(response.status, endpointNumber);
               break;
             }
 
@@ -325,10 +358,14 @@ async function pageExport(includeImages, includeAttachments) {
 
               if (!url) {
                 resolutionDiagnostics.json_no_url++;
+                resolutionDiagnostics[`endpoint_${endpointNumber}_json_no_url`]++;
                 break;
               }
 
               resolutionDiagnostics.success_json++;
+              resolutionDiagnostics.resolved++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_success_json`]++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
               return {
                 fileId: fid,
                 url,
@@ -351,6 +388,9 @@ async function pageExport(includeImages, includeAttachments) {
               } catch (_) {}
 
               resolutionDiagnostics.success_response++;
+              resolutionDiagnostics.resolved++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_success_response`]++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
               return {
                 fileId: fid,
                 url: response.url || endpoint,
@@ -360,9 +400,12 @@ async function pageExport(includeImages, includeAttachments) {
             }
 
             resolutionDiagnostics.html_rejected++;
+            resolutionDiagnostics[`endpoint_${endpointNumber}_html_rejected`]++;
             break;
-          } catch (_) {
-            resolutionDiagnostics.network++;
+          } catch (error) {
+            const key = error && error.name === "AbortError" ? "timeout" : "network";
+            resolutionDiagnostics[key]++;
+            resolutionDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
 
             if (attempt < 1) {
               resolutionDiagnostics.retries++;
@@ -374,6 +417,7 @@ async function pageExport(includeImages, includeAttachments) {
         }
       }
 
+      resolutionDiagnostics.final_no_url++;
       return { fileId: fid, url: null, mime: null, originalName: null };
     }
 
@@ -408,6 +452,7 @@ async function pageExport(includeImages, includeAttachments) {
       name: `image-${String(index + 1).padStart(3, "0")}.${extensionFor(image)}`,
     }));
     result.resolutionDiagnostics = resolutionDiagnostics;
+    result.imageDiscoveryDiagnostics = imageDiscoveryDiagnostics;
 
     const attachmentDiagnostics = {
       resolved: 0, no_url: 0, http_401: 0, http_403: 0, http_404: 0,
