@@ -5,6 +5,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync('extension/popup.js', 'utf8');
 const coreSource = fs.readFileSync('extension/export-core.js', 'utf8');
+const exporterSource = fs.readFileSync('extension/exporter.js', 'utf8');
 const manifestSource = fs.readFileSync('extension/manifest.json', 'utf8');
 
 function loadHelpers(fetchImpl) {
@@ -68,6 +69,42 @@ function loadHelpers(fetchImpl) {
   vm.runInContext(coreSource, context);
   vm.runInContext(`${source}\nthis.testAPI = { safeName, exportFilename: typeof exportFilename === 'undefined' ? null : exportFilename, safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive, buildZipBlob, downloadFileInPage: typeof downloadFileInPage === 'undefined' ? null : downloadFileInPage, downloadZipFromPopup: typeof downloadZipFromPopup === 'undefined' ? null : downloadZipFromPopup, zipTransferChunkBytes: typeof ZIP_TRANSFER_CHUNK_BYTES === 'undefined' ? null : ZIP_TRANSFER_CHUNK_BYTES, hasPendingZipTransfer: () => Object.prototype.hasOwnProperty.call(globalThis, '__chatgptExporterZipTransfer') };`, context);
   return Object.assign(context.testAPI, { downloadNames, injectedCalls, createdBlobs, revokedUrls, storageAccesses });
+}
+
+function createPageExportHarness(attachment, resolveEndpoint) {
+  const endpointCalls = [];
+  const jsonResponse = (value, overrides = {}) => ({
+    ok: true,
+    status: 200,
+    redirected: false,
+    url: '',
+    headers: { get: (name) => name === 'content-type' ? 'application/json' : null },
+    json: async () => value,
+    ...overrides,
+  });
+  const context = {
+    window: {},
+    location: { pathname: '/c/12345678-1234-1234-1234-123456789012' },
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url, options) => {
+      if (url === '/api/auth/session') return jsonResponse({ accessToken: 'resolver-test-bearer-secret' });
+      if (url.startsWith('/backend-api/conversation/')) return jsonResponse({
+        title: 'Resolver test', current_node: 'node-1', mapping: { 'node-1': { parent: null, message: {
+          author: { role: 'user' }, content: { parts: [] }, metadata: { attachments: [attachment] },
+        } } },
+      });
+      endpointCalls.push({ url, authorization: options && options.headers && options.headers.Authorization });
+      return resolveEndpoint(url, endpointCalls.length, jsonResponse);
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(exporterSource, context);
+  return {
+    endpointCalls,
+    pageExport: () => vm.runInContext('pageExport(false, true)', context),
+  };
 }
 
 async function readStoredZipEntries(blob) {
@@ -196,6 +233,8 @@ test('report separates image and attachment totals and contains no identifiers o
   assert.match(report, /Images failed: 1/);
   assert.match(report, /Attachments detected: 1/);
   assert.match(report, /Attachments downloaded: 1/);
+  assert.match(report, /Attachment diagnostics \(downloader stage, aggregate only\):/);
+  assert.match(report, /Attachment resolver diagnostics \(aggregate only\):/);
   assert.match(report, /attachment-content_type: 0/);
   assert.match(report, /image-network: 0/);
   assert.match(report, /Version: 2\.9-private/);
@@ -265,6 +304,117 @@ test('successful original PDF export excludes its rendered preview from image fa
   assert.equal(result.images.length, 1);
   assert.equal(result.skipped.length, 1);
   assert.equal(result.images[0].fileId, 'photo-id');
+});
+
+test('attachment resolver reports endpoint-specific HTTP and JSON failures without leaking private data', async () => {
+  const harness = createPageExportHarness({
+    id: 'private-test-file-id',
+    file_id: 'must-not-win-file-id',
+    asset_pointer: 'must-not-win-asset-pointer',
+    name: 'private-customer-contract.pdf',
+    mime_type: 'application/pdf',
+  }, (_url, call, jsonResponse) => call === 1
+    ? jsonResponse({}, { ok: false, status: 403 })
+    : jsonResponse({ private_body_marker: 'secret response body content' }));
+  const result = await harness.pageExport();
+  const diagnostics = result.attachmentResolverDiagnostics;
+
+  assert.equal(harness.endpointCalls.length, 2);
+  assert.match(harness.endpointCalls[0].url, /files\/download\/private-test-file-id$/);
+  assert.match(harness.endpointCalls[1].url, /files\/private-test-file-id\/download$/);
+  assert.equal(harness.endpointCalls.some(({ url }) => /must-not-win/.test(url)), false);
+  assert.equal(diagnostics.id_source_id, 1);
+  assert.equal(diagnostics.attempts, 2);
+  assert.equal(diagnostics.resolved, 0);
+  assert.equal(diagnostics.endpoint_1_http_403, 1);
+  assert.equal(diagnostics.endpoint_2_json_no_url, 1);
+  assert.equal(result.attachments[0].url, null);
+
+  const report = loadHelpers().buildExportReport(
+    { detected: 0, downloaded: 0, failed: 0 },
+    { detected: 1, downloaded: 0, failed: 1, diagnostics: {} },
+    true,
+    diagnostics,
+  );
+  for (const privateValue of [
+    'resolver-test-bearer-secret',
+    'private-test-file-id',
+    'must-not-win-file-id',
+    'must-not-win-asset-pointer',
+    'private-customer-contract.pdf',
+    'secret response body content',
+  ]) assert.equal(report.includes(privateValue), false);
+  assert.doesNotMatch(report, /Bearer\s+\S+/i);
+  assert.match(report, /Attachment resolver diagnostics \(aggregate only\):/);
+  assert.match(report, /attachment-id_source-id: 1/);
+  assert.match(report, /attachment-resolver-attempts: 2/);
+  assert.match(report, /attachment-resolver-http_403: 1/);
+  assert.match(report, /attachment-resolver-json_no_url: 1/);
+  assert.match(report, /attachment-resolver-endpoint_1-http_403: 1/);
+  assert.match(report, /attachment-resolver-endpoint_2-json_no_url: 1/);
+});
+
+test('attachment resolver recognizes top-level and metadata download URLs', async (t) => {
+  for (const fixture of [
+    { name: 'top-level download_url', payload: { download_url: 'https://files.oaiusercontent.com/signed-top-level-secret' }, key: 'endpoint_1_json_download_url' },
+    { name: 'metadata.download_url', payload: { metadata: { download_url: 'https://files.oaiusercontent.com/signed-metadata-secret' } }, key: 'endpoint_1_json_metadata_download_url' },
+  ]) {
+    await t.test(fixture.name, async () => {
+      const harness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, (_url, _call, jsonResponse) => jsonResponse(fixture.payload));
+      const result = await harness.pageExport();
+      assert.equal(result.attachmentResolverDiagnostics.attempts, 1);
+      assert.equal(result.attachmentResolverDiagnostics.resolved, 1);
+      assert.equal(result.attachmentResolverDiagnostics[fixture.key], 1);
+      assert.equal(result.attachments[0].url, fixture.payload.download_url || fixture.payload.metadata.download_url);
+      const report = loadHelpers().buildExportReport({}, {}, true, result.attachmentResolverDiagnostics);
+      assert.equal(report.includes(result.attachments[0].url), false);
+    });
+  }
+});
+
+test('attachment resolver distinguishes timeout, network, and HTML without a URL', async () => {
+  const harness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, (url, _call, jsonResponse) => {
+    if (url.includes('/files/download/')) throw Object.assign(new Error('private transport detail'), { name: 'AbortError' });
+    if (url.endsWith('/download')) return jsonResponse({}, { headers: { get: () => 'text/html' } });
+    throw new Error('unexpected endpoint');
+  });
+  const result = await harness.pageExport();
+  const diagnostics = result.attachmentResolverDiagnostics;
+  assert.equal(diagnostics.attempts, 2);
+  assert.equal(diagnostics.endpoint_1_timeout, 1);
+  assert.equal(diagnostics.endpoint_2_html_no_url, 1);
+  assert.equal(diagnostics.timeout, 1);
+  assert.equal(diagnostics.html_no_url, 1);
+
+  const networkHarness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, () => {
+    throw new TypeError('private network detail');
+  });
+  const networkResult = await networkHarness.pageExport();
+  assert.equal(networkResult.attachmentResolverDiagnostics.network, 2);
+  assert.equal(networkResult.attachmentResolverDiagnostics.timeout, 0);
+});
+
+test('attachment resolver classifies redirects and valid non-HTML responses', async (t) => {
+  for (const fixture of [
+    {
+      name: 'redirect',
+      response: () => ({ ok: true, status: 200, redirected: true, url: 'https://files.oaiusercontent.com/private-signed-redirect', headers: { get: () => 'text/html' }, body: { cancel() {} } }),
+      key: 'endpoint_1_redirect',
+    },
+    {
+      name: 'non-HTML response',
+      response: () => ({ ok: true, status: 200, redirected: false, url: 'https://files.oaiusercontent.com/private-direct-download', headers: { get: () => 'application/octet-stream' }, body: { cancel() {} } }),
+      key: 'endpoint_1_non_html_response',
+    },
+  ]) {
+    await t.test(fixture.name, async () => {
+      const harness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, (_url, _call, jsonResponse) => fixture.response(jsonResponse));
+      const result = await harness.pageExport();
+      assert.equal(result.attachmentResolverDiagnostics[fixture.key], 1);
+      assert.equal(result.attachmentResolverDiagnostics.resolved, 1);
+      assert.equal(harness.endpointCalls.length, 1);
+    });
+  }
 });
 
 test('page export discovers original PDF metadata and associates its rendered page preview', async () => {

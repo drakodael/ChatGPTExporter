@@ -108,6 +108,11 @@ async function pageExport(includeImages, includeAttachments) {
     const imagePreviewAttachment = new Map();
     const attachmentOrder = [];
     const attachmentSeen = new Set();
+    const attachmentIdSourceDiagnostics = {
+      id_source_id: 0,
+      id_source_file_id: 0,
+      id_source_asset_pointer: 0,
+    };
 
     function rememberImage(fid, previewAttachmentId) {
       if (!fid || imageSeen.has(fid)) return;
@@ -122,10 +127,12 @@ async function pageExport(includeImages, includeAttachments) {
       for (const attachment of attachments) {
         if (!attachment || typeof attachment !== "object") continue;
         if (String(attachment.mime_type || "").toLowerCase().startsWith("image/")) continue;
-        const pointer = attachment.id || attachment.file_id || attachment.asset_pointer;
+        const source = attachment.id ? "id" : attachment.file_id ? "file_id" : attachment.asset_pointer ? "asset_pointer" : null;
+        const pointer = source ? attachment[source] : null;
         const fileId = fileIdOf(pointer);
         if (!fileId || attachmentSeen.has(fileId)) continue;
         attachmentSeen.add(fileId);
+        attachmentIdSourceDiagnostics[`id_source_${source}`]++;
         attachmentOrder.push({
           fileId,
           name: typeof attachment.name === "string" ? attachment.name : "",
@@ -385,6 +392,28 @@ async function pageExport(includeImages, includeAttachments) {
       resolved: 0, no_url: 0, http_401: 0, http_403: 0, http_404: 0,
       http_429: 0, http_5xx: 0, http_other: 0, network: 0,
     };
+    const resolverOutcomeKeys = [
+      "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other",
+      "network", "timeout", "json_download_url", "json_metadata_download_url",
+      "json_no_url", "redirect", "non_html_response", "html_no_url",
+    ];
+    const attachmentResolverDiagnostics = {
+      attempts: 0,
+      resolved: 0,
+      ...Object.fromEntries(resolverOutcomeKeys.map((key) => [key, 0])),
+      endpoint_1_attempts: 0,
+      endpoint_2_attempts: 0,
+      ...Object.fromEntries([1, 2].flatMap((endpointNumber) =>
+        resolverOutcomeKeys.map((key) => [`endpoint_${endpointNumber}_${key}`, 0])
+      )),
+      ...attachmentIdSourceDiagnostics,
+    };
+
+    function recordAttachmentResolverOutcome(key, endpointNumber) {
+      attachmentResolverDiagnostics[key]++;
+      attachmentResolverDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
+    }
+
     const attachments = [];
     if (includeAttachments) {
       for (const attachment of attachmentOrder) {
@@ -393,20 +422,28 @@ async function pageExport(includeImages, includeAttachments) {
           `/backend-api/files/download/${encodeURIComponent(attachment.fileId)}`,
           `/backend-api/files/${encodeURIComponent(attachment.fileId)}/download`,
         ];
-        for (const endpoint of endpoints) {
+        for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
+          const endpoint = endpoints[endpointIndex];
+          const endpointNumber = endpointIndex + 1;
+          attachmentResolverDiagnostics.attempts++;
+          attachmentResolverDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
           try {
             const response = await fetchWithTimeout(endpoint, auth, 20000);
             if (!response.ok) {
               const status = response.status;
               const key = status === 401 ? "http_401" : status === 403 ? "http_403" : status === 404 ? "http_404" : status === 429 ? "http_429" : status >= 500 ? "http_5xx" : "http_other";
               attachmentDiagnostics[key]++;
+              recordAttachmentResolverOutcome(key, endpointNumber);
               continue;
             }
             const type = (response.headers.get("content-type") || "").toLowerCase();
             if (type.includes("application/json")) {
               const payload = await response.json();
-              const url = payload.download_url || (payload.metadata && payload.metadata.download_url);
+              const directURL = payload && payload.download_url;
+              const metadataURL = payload && payload.metadata && payload.metadata.download_url;
+              const url = directURL || metadataURL;
               if (url) {
+                recordAttachmentResolverOutcome(directURL ? "json_download_url" : "json_metadata_download_url", endpointNumber);
                 found = {
                   fileId: attachment.fileId,
                   url,
@@ -416,19 +453,24 @@ async function pageExport(includeImages, includeAttachments) {
                 break;
               }
               attachmentDiagnostics.no_url++;
+              recordAttachmentResolverOutcome("json_no_url", endpointNumber);
             } else if (response.redirected || !type.includes("text/html")) {
               try { if (response.body) response.body.cancel(); } catch (_) {}
+              recordAttachmentResolverOutcome(response.redirected ? "redirect" : "non_html_response", endpointNumber);
               found = { ...attachment, url: response.url || endpoint };
               break;
             } else {
               attachmentDiagnostics.no_url++;
+              recordAttachmentResolverOutcome("html_no_url", endpointNumber);
             }
-          } catch (_) {
+          } catch (error) {
             attachmentDiagnostics.network++;
+            recordAttachmentResolverOutcome(error && error.name === "AbortError" ? "timeout" : "network", endpointNumber);
           }
         }
         if (found) {
           attachmentDiagnostics.resolved++;
+          attachmentResolverDiagnostics.resolved++;
           attachments.push(found);
         } else {
           attachments.push({ ...attachment, url: null });
@@ -437,6 +479,7 @@ async function pageExport(includeImages, includeAttachments) {
     }
     result.attachments = attachments;
     result.attachmentDiagnostics = attachmentDiagnostics;
+    result.attachmentResolverDiagnostics = attachmentResolverDiagnostics;
 
     // Return the bearer token transiently only for an explicitly requested file
     // export. Consumers must restrict authenticated requests to OpenAI hosts.

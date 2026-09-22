@@ -485,9 +485,15 @@ async function fetchAttachmentsForArchive(attachments, accessToken) {
   return { files, failed, diagnostics };
 }
 
-function buildExportReport(imageResult, attachmentResult, hadToken) {
+function buildExportReport(imageResult, attachmentResult, hadToken, attachmentResolverDiagnostics) {
   const images = imageResult || {};
   const attachments = attachmentResult || {};
+  const resolver = attachmentResolverDiagnostics || {};
+  const resolverOutcomeKeys = [
+    "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other",
+    "network", "timeout", "json_download_url", "json_metadata_download_url",
+    "json_no_url", "redirect", "non_html_response", "html_no_url",
+  ];
   return [
     "ChatGPT Local Exporter - file export report", "Version: 2.9-private", "",
     `Images detected: ${images.detected || 0}`,
@@ -501,9 +507,20 @@ function buildExportReport(imageResult, attachmentResult, hadToken) {
     `Attachment direct downloads: ${(attachments.diagnostics && attachments.diagnostics.direct_ok) || 0}`,
     `Attachment authenticated downloads: ${(attachments.diagnostics && attachments.diagnostics.auth_ok) || 0}`,
     `Transient session token available: ${hadToken ? "yes" : "no"}`, "",
-    "Attachment diagnostics (aggregate only):",
+    "Attachment diagnostics (downloader stage, aggregate only):",
     ...["direct_ok", "auth_ok", "no_url", "invalid_host", "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other", "content_type", "network"].map((key) => `attachment-${key}: ${(attachments.diagnostics && attachments.diagnostics[key]) || 0}`), "",
-    "Privacy:", "- Aggregate counts only; no token, signed URL, or file ID is included.", "",
+    "Attachment resolver diagnostics (aggregate only):",
+    `attachment-id_source-id: ${resolver.id_source_id || 0}`,
+    `attachment-id_source-file_id: ${resolver.id_source_file_id || 0}`,
+    `attachment-id_source-asset_pointer: ${resolver.id_source_asset_pointer || 0}`,
+    `attachment-resolver-attempts: ${resolver.attempts || 0}`,
+    `attachment-resolver-resolved: ${resolver.resolved || 0}`,
+    ...resolverOutcomeKeys.map((key) => `attachment-resolver-${key}: ${resolver[key] || 0}`),
+    ...[1, 2].flatMap((endpointNumber) => [
+      `attachment-resolver-endpoint_${endpointNumber}-attempts: ${resolver[`endpoint_${endpointNumber}_attempts`] || 0}`,
+      ...resolverOutcomeKeys.map((key) => `attachment-resolver-endpoint_${endpointNumber}-${key}: ${resolver[`endpoint_${endpointNumber}_${key}`] || 0}`),
+    ]), "",
+    "Privacy:", "- Aggregate counts only; no token, ID, private resource name, URL, or response body is included.", "",
   ].join("\n");
 }
 
@@ -768,7 +785,7 @@ async function exportConversation(includeImages, includeAttachments, permissionP
         failed: 0,
         diagnostics: {},
       };
-      const report = buildExportReport({ detected: 0, downloaded: 0, failed: 0 }, { detected: 0, downloaded: 0, failed: 0 }, false);
+      const report = buildExportReport({ detected: 0, downloaded: 0, failed: 0 }, { detected: 0, downloaded: 0, failed: 0 }, false, result.attachmentResolverDiagnostics);
       const entries = [
         {
           name: "conversation.md",
@@ -800,7 +817,8 @@ async function exportConversation(includeImages, includeAttachments, permissionP
     const report = buildExportReport(
       { detected: images.length - imageSelection.skipped.length, downloaded: imageDownloaded, failed: fetched.failed, diagnostics: fetched.diagnostics },
       { detected: attachmentDescriptors.length, downloaded: fetchedAttachments.files.length, failed: fetchedAttachments.failed, diagnostics: fetchedAttachments.diagnostics },
-      !!accessToken
+      !!accessToken,
+      result.attachmentResolverDiagnostics
     );
     entries.push({
       name: "export-report.txt",
