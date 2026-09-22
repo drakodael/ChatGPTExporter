@@ -232,3 +232,70 @@ https://*.oaiusercontent.com/*
 The popup accepts only those HTTPS hosts. ChatGPT image endpoints are tried
 without credentials first and, if needed, retried with the transient bearer
 token. The token is never persisted.
+
+
+### v2.7 — Safari filename workaround + resolver hardening
+
+Based on the read-only KDES/Superpower-style audit and the successful v2.6 export
+(135/137 images), v2.7 makes two targeted changes while keeping `main` untouched.
+
+#### ZIP filename workaround
+
+Safari was saving popup-originated Blob downloads as `Unknown-N` even though the
+anchor's `download` attribute contained the intended filename.
+
+v2.7 now:
+
+- builds the ZIP Blob with MIME type `application/zip`;
+- wraps that Blob in a named `File` object before creating the object URL;
+- keeps the anchor `download` attribute set to the same conversation-derived name;
+- sets the anchor type to `application/zip`.
+
+This is intentionally a no-Xcode workaround. Safari still needs a manual verification
+because WebExtension Blob download behavior is browser-specific.
+
+#### Image resolver hardening
+
+The two v2.6 failures were `no-url`, so v2.7 broadens only the resolver stage:
+
+- retries 429 and 5xx responses with bounded backoff;
+- retries one timeout/network failure;
+- accepts successful non-HTML responses such as `application/octet-stream`, matching
+  the upstream exporter's tolerant behavior;
+- retains the existing endpoint allowlist in the popup;
+- preserves unauthenticated-first download behavior and transient-token retry.
+
+The ZIP report now includes aggregate resolver diagnostics only:
+
+- success-json
+- success-response
+- json-no-url
+- html-rejected
+- resolver HTTP status buckets
+- resolver network failures
+- resolver retry count
+
+No response body, URL, file ID, or token is written to the report.
+
+#### Manual verification
+
+After pulling v2.7 and reloading the temporary Safari extension:
+
+```bash
+grep '"version"' extension/manifest.json
+```
+
+Expected:
+
+```text
+"version": "2.7-private",
+```
+
+Export the same image-heavy chat, then inspect the newest download. Verify both:
+
+1. whether Safari now uses the conversation-derived `.zip` filename instead of
+   `Unknown-N`;
+2. whether `Images downloaded` improves from 135/137.
+
+If unresolved images remain, inspect `export-report.txt` for the new resolver
+diagnostic counters before changing endpoint parsing further.
