@@ -212,6 +212,31 @@ async function pageExport(includeImages) {
     }
 
     const auth = { headers: { Authorization: `Bearer ${accessToken}` } };
+    const resolutionDiagnostics = {
+      success_json: 0,
+      success_response: 0,
+      json_no_url: 0,
+      html_rejected: 0,
+      http_401: 0,
+      http_403: 0,
+      http_404: 0,
+      http_429: 0,
+      http_5xx: 0,
+      http_other: 0,
+      network: 0,
+      retries: 0,
+    };
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function recordResolverHTTP(status) {
+      if (status === 401) resolutionDiagnostics.http_401++;
+      else if (status === 403) resolutionDiagnostics.http_403++;
+      else if (status === 404) resolutionDiagnostics.http_404++;
+      else if (status === 429) resolutionDiagnostics.http_429++;
+      else if (status >= 500) resolutionDiagnostics.http_5xx++;
+      else resolutionDiagnostics.http_other++;
+    }
 
     async function resolveImage(fid) {
       const endpoints = [
@@ -220,47 +245,80 @@ async function pageExport(includeImages) {
       ];
 
       for (const endpoint of endpoints) {
-        try {
-          const response = await fetchWithTimeout(endpoint, auth, 20000);
-          if (!response.ok) continue;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const response = await fetchWithTimeout(endpoint, auth, 20000);
 
-          const contentType = response.headers.get("content-type") || "";
-          if (contentType.includes("application/json")) {
-            const payload = await response.json();
-            const url =
-              payload.download_url ||
-              (payload.metadata && payload.metadata.download_url) ||
-              null;
-            if (!url) continue;
+            if (!response.ok) {
+              const transient = response.status === 429 || response.status >= 500;
+              if (transient && attempt < 2) {
+                const retryAfter = Number(response.headers.get("retry-after")) || 0;
+                resolutionDiagnostics.retries++;
+                await sleep(Math.min((retryAfter || 2) * 1000 * (attempt + 1), 10000));
+                continue;
+              }
 
-            return {
-              fileId: fid,
-              url,
-              mime:
-                (payload.metadata && payload.metadata.mime_type) ||
-                payload.mime_type ||
-                null,
-              originalName:
-                (payload.metadata && payload.metadata.file_name) ||
-                payload.file_name ||
-                null,
-            };
+              recordResolverHTTP(response.status);
+              break;
+            }
+
+            const contentType = (response.headers.get("content-type") || "").toLowerCase();
+
+            if (contentType.includes("application/json")) {
+              const payload = await response.json();
+              const url =
+                payload.download_url ||
+                (payload.metadata && payload.metadata.download_url) ||
+                null;
+
+              if (!url) {
+                resolutionDiagnostics.json_no_url++;
+                break;
+              }
+
+              resolutionDiagnostics.success_json++;
+              return {
+                fileId: fid,
+                url,
+                mime:
+                  (payload.metadata && payload.metadata.mime_type) ||
+                  payload.mime_type ||
+                  null,
+                originalName:
+                  (payload.metadata && payload.metadata.file_name) ||
+                  payload.file_name ||
+                  null,
+              };
+            }
+
+            // A successful non-HTML response is usable even when ChatGPT labels
+            // it as application/octet-stream or omits an image MIME type.
+            if (response.redirected || !contentType.includes("text/html")) {
+              try {
+                if (response.body) response.body.cancel();
+              } catch (_) {}
+
+              resolutionDiagnostics.success_response++;
+              return {
+                fileId: fid,
+                url: response.url || endpoint,
+                mime: contentType || null,
+                originalName: null,
+              };
+            }
+
+            resolutionDiagnostics.html_rejected++;
+            break;
+          } catch (_) {
+            resolutionDiagnostics.network++;
+
+            if (attempt < 1) {
+              resolutionDiagnostics.retries++;
+              await sleep(1000);
+              continue;
+            }
+            break;
           }
-
-          if (response.redirected || contentType.startsWith("image/")) {
-            try {
-              if (response.body) response.body.cancel();
-            } catch (_) {}
-
-            return {
-              fileId: fid,
-              url: response.url || endpoint,
-              mime: contentType || null,
-              originalName: null,
-            };
-          }
-        } catch (_) {
-          // Try the next endpoint shape. Missing images are handled gracefully.
         }
       }
 
@@ -296,6 +354,7 @@ async function pageExport(includeImages) {
       mime: image.mime,
       name: `image-${String(index + 1).padStart(3, "0")}.${extensionFor(image)}`,
     }));
+    result.resolutionDiagnostics = resolutionDiagnostics;
 
     // Image export only: return the bearer token transiently to the popup so it
     // can retry OpenAI CDN downloads that reject an otherwise valid signed URL.
