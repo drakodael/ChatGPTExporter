@@ -71,8 +71,9 @@ function loadHelpers(fetchImpl) {
   return Object.assign(context.testAPI, { downloadNames, injectedCalls, createdBlobs, revokedUrls, storageAccesses });
 }
 
-function createPageExportHarness(attachment, resolveEndpoint) {
+function createPageExportHarness(attachment, resolveEndpoint, previewFileId = null) {
   const endpointCalls = [];
+  const attachments = Array.isArray(attachment) ? attachment : [attachment];
   const jsonResponse = (value, overrides = {}) => ({
     ok: true,
     status: 200,
@@ -92,7 +93,9 @@ function createPageExportHarness(attachment, resolveEndpoint) {
       if (url === '/api/auth/session') return jsonResponse({ accessToken: 'resolver-test-bearer-secret' });
       if (url.startsWith('/backend-api/conversation/')) return jsonResponse({
         title: 'Resolver test', current_node: 'node-1', mapping: { 'node-1': { parent: null, message: {
-          author: { role: 'user' }, content: { parts: [] }, metadata: { attachments: [attachment] },
+          author: { role: 'user' },
+          content: { parts: previewFileId ? [{ content_type: 'image_asset_pointer', asset_pointer: `file-service://${previewFileId}` }] : [] },
+          metadata: { attachments },
         } } },
       });
       endpointCalls.push({ url, authorization: options && options.headers && options.headers.Authorization });
@@ -103,7 +106,7 @@ function createPageExportHarness(attachment, resolveEndpoint) {
   vm.runInContext(exporterSource, context);
   return {
     endpointCalls,
-    pageExport: () => vm.runInContext('pageExport(false, true)', context),
+    pageExport: (includeImages = false) => vm.runInContext(`pageExport(${includeImages}, true)`, context),
   };
 }
 
@@ -194,7 +197,7 @@ test('ZIP paths share the sanitized conversation root while Markdown links and a
     { name: 'export-report.txt', data: new TextEncoder().encode('aggregate report') },
     { name: 'images/image-001.png', data: new Uint8Array([1, 2, 3]) },
   ];
-  addAttachmentsToArchive(entries, [{ fileId: 'pdf-1', name: 'archivo.pdf', bytes: new Uint8Array([4, 5, 6]) }]);
+  addAttachmentsToArchive(entries, [{ attachmentKey: 'pdf-1', name: 'archivo.pdf', bytes: new Uint8Array([4, 5, 6]) }]);
 
   const zipEntries = await readStoredZipEntries(buildZipBlob(entries, root));
   assert.deepEqual([...zipEntries.keys()].sort(), [
@@ -246,7 +249,7 @@ test('successful original attachment is archived separately from image entries',
   const images = [{ fileId: 'image-id', name: 'image-001.png' }];
   const fetchedImages = { files: new Map([['image-id', { name: 'image-001.png', bytes: new Uint8Array([1]) }]]), failed: 0, diagnostics: {} };
   const entries = buildArchiveMarkdown('# Chat\n\n@@IMG@@image-id@@', images, fetchedImages);
-  const attachments = [{ fileId: 'private-id', name: 'receipt.pdf', bytes: new Uint8Array([2]) }];
+  const attachments = [{ attachmentKey: 'private-id', name: 'receipt.pdf', bytes: new Uint8Array([2]) }];
   const { addAttachmentsToArchive } = loadHelpers();
   addAttachmentsToArchive(entries, attachments);
   assert.ok(entries.some((entry) => entry.name === 'images/image-001.png'));
@@ -256,13 +259,13 @@ test('successful original attachment is archived separately from image entries',
 test('attachment links point to the archived local file and duplicate names stay unique', () => {
   const { addAttachmentsToArchive, linkDownloadedAttachments, markSkippedPDFPreviews } = loadHelpers();
   const files = [
-    { fileId: 'one', name: 'receipt.pdf', bytes: new Uint8Array([2]) },
-    { fileId: 'two', name: 'receipt.pdf', bytes: new Uint8Array([3]) },
+    { attachmentKey: 'one', name: 'receipt.pdf', bytes: new Uint8Array([2]) },
+    { attachmentKey: 'two', name: 'receipt.pdf', bytes: new Uint8Array([3]) },
   ];
   const entries = [];
   addAttachmentsToArchive(entries, files);
   assert.deepEqual(entries.map((entry) => entry.name), ['attachments/receipt.pdf', 'attachments/receipt-2.pdf']);
-  const markdown = linkDownloadedAttachments('_[attachment omitted: receipt.pdf]_ @@IMG@@preview@@', [{ fileId: 'one', name: 'receipt.pdf' }], files);
+  const markdown = linkDownloadedAttachments('_[attachment omitted: receipt.pdf]_ @@IMG@@preview@@', [{ attachmentKey: 'one', name: 'receipt.pdf' }], files);
   assert.match(markdown, /\[receipt\.pdf\]\(attachments\/receipt\.pdf\)/);
   assert.match(markSkippedPDFPreviews(markdown, [{ fileId: 'preview', previewAttachmentId: 'one' }], files), /original PDF: receipt\.pdf/);
 });
@@ -285,7 +288,7 @@ test('original PDF bytes are exported while image payloads are rejected as attac
     arrayBuffer: async () => new Uint8Array([37, 80, 68, 70]).buffer,
   }));
   const result = await fetchAttachmentsForArchive([
-    { fileId: 'pdf-id', name: 'receipt.pdf', mime: 'application/pdf', url: 'https://files.oaiusercontent.com/receipt.pdf' },
+    { attachmentKey: 'pdf-id', name: 'receipt.pdf', mime: 'application/pdf', url: 'https://files.oaiusercontent.com/receipt.pdf' },
     { fileId: 'image-id', name: 'photo.png', mime: 'image/png', url: 'https://files.oaiusercontent.com/photo.png' },
   ], null);
   assert.equal(result.files.length, 1);
@@ -300,7 +303,7 @@ test('successful original PDF export excludes its rendered preview from image fa
   const result = excludeSuccessfulPDFPreviews([
     { fileId: 'preview-id', previewAttachmentId: 'pdf-id' },
     { fileId: 'photo-id', previewAttachmentId: null },
-  ], [{ fileId: 'pdf-id', name: 'receipt.pdf' }]);
+  ], [{ attachmentKey: 'pdf-id', name: 'receipt.pdf' }]);
   assert.equal(result.images.length, 1);
   assert.equal(result.skipped.length, 1);
   assert.equal(result.images[0].fileId, 'photo-id');
@@ -309,8 +312,6 @@ test('successful original PDF export excludes its rendered preview from image fa
 test('attachment resolver reports endpoint-specific HTTP and JSON failures without leaking private data', async () => {
   const harness = createPageExportHarness({
     id: 'private-test-file-id',
-    file_id: 'must-not-win-file-id',
-    asset_pointer: 'must-not-win-asset-pointer',
     name: 'private-customer-contract.pdf',
     mime_type: 'application/pdf',
   }, (_url, call, jsonResponse) => call === 1
@@ -322,7 +323,6 @@ test('attachment resolver reports endpoint-specific HTTP and JSON failures witho
   assert.equal(harness.endpointCalls.length, 2);
   assert.match(harness.endpointCalls[0].url, /files\/download\/private-test-file-id$/);
   assert.match(harness.endpointCalls[1].url, /files\/private-test-file-id\/download$/);
-  assert.equal(harness.endpointCalls.some(({ url }) => /must-not-win/.test(url)), false);
   assert.equal(diagnostics.id_source_id, 1);
   assert.equal(diagnostics.attempts, 2);
   assert.equal(diagnostics.resolved, 0);
@@ -339,8 +339,6 @@ test('attachment resolver reports endpoint-specific HTTP and JSON failures witho
   for (const privateValue of [
     'resolver-test-bearer-secret',
     'private-test-file-id',
-    'must-not-win-file-id',
-    'must-not-win-asset-pointer',
     'private-customer-contract.pdf',
     'secret response body content',
   ]) assert.equal(report.includes(privateValue), false);
@@ -352,6 +350,147 @@ test('attachment resolver reports endpoint-specific HTTP and JSON failures witho
   assert.match(report, /attachment-resolver-json_no_url: 1/);
   assert.match(report, /attachment-resolver-endpoint_1-http_403: 1/);
   assert.match(report, /attachment-resolver-endpoint_2-json_no_url: 1/);
+});
+
+test('attachment resolver falls back from both id endpoints to file_id while retaining the logical key', async () => {
+  const harness = createPageExportHarness({
+    id: 'logical-id-secret',
+    file_id: 'resolver-file-id-secret',
+    asset_pointer: 'resolver-asset-pointer-secret',
+    name: 'private-receipt.pdf',
+    mime_type: 'application/pdf',
+  }, (url, _call, jsonResponse) => {
+    if (url.includes('logical-id-secret')) return jsonResponse({}, { ok: false, status: 403 });
+    if (url === '/backend-api/files/download/resolver-file-id-secret') {
+      return jsonResponse({ download_url: 'https://files.oaiusercontent.com/signed-url-secret', private_body: 'private response body secret' });
+    }
+    throw new Error('unexpected resolver candidate or endpoint');
+  });
+  const result = await harness.pageExport();
+  const diagnostics = result.attachmentResolverDiagnostics;
+
+  assert.equal(harness.endpointCalls.length, 3);
+  assert.deepEqual(harness.endpointCalls.map((call) => call.url), [
+    '/backend-api/files/download/logical-id-secret',
+    '/backend-api/files/logical-id-secret/download',
+    '/backend-api/files/download/resolver-file-id-secret',
+  ]);
+  assert.equal(result.attachments[0].attachmentKey, 'logical-id-secret');
+  assert.equal(result.attachments[0].url, 'https://files.oaiusercontent.com/signed-url-secret');
+  assert.equal(diagnostics.candidate_present_id, 1);
+  assert.equal(diagnostics.candidate_present_file_id, 1);
+  assert.equal(diagnostics.candidate_present_asset_pointer, 1);
+  assert.equal(diagnostics.candidate_attempt_id, 2);
+  assert.equal(diagnostics.candidate_attempt_file_id, 1);
+  assert.equal(diagnostics.candidate_attempt_asset_pointer, 0);
+  assert.equal(diagnostics.candidate_resolved_id, 0);
+  assert.equal(diagnostics.candidate_resolved_file_id, 1);
+  assert.equal(diagnostics.candidate_resolved_asset_pointer, 0);
+
+  const report = loadHelpers().buildExportReport({}, {}, true, diagnostics);
+  for (const secret of [
+    'logical-id-secret',
+    'resolver-file-id-secret',
+    'resolver-asset-pointer-secret',
+    'private-receipt.pdf',
+    'signed-url-secret',
+    'private response body secret',
+    'resolver-test-bearer-secret',
+  ]) assert.equal(report.includes(secret), false);
+  assert.match(report, /attachment-candidate-present-id: 1/);
+  assert.match(report, /attachment-candidate-attempt-file_id: 1/);
+  assert.match(report, /attachment-candidate-resolved-file_id: 1/);
+});
+
+test('attachment resolver falls back through id and file_id to asset_pointer', async () => {
+  const harness = createPageExportHarness({
+    id: 'logical-id',
+    file_id: 'file-id-candidate',
+    asset_pointer: 'file-service://asset-pointer-candidate',
+    name: 'receipt.pdf',
+    mime_type: 'application/pdf',
+  }, (url, _call, jsonResponse) => {
+    if (url.includes('asset-pointer-candidate') && url.startsWith('/backend-api/files/download/')) return jsonResponse({ download_url: 'https://files.oaiusercontent.com/receipt.pdf' });
+    if (!url.includes('asset-pointer-candidate')) return jsonResponse({}, { ok: false, status: 403 });
+    throw new Error('unexpected endpoint');
+  });
+  const result = await harness.pageExport();
+  assert.equal(harness.endpointCalls.length, 5);
+  assert.equal(result.attachments[0].attachmentKey, 'logical-id');
+  assert.equal(result.attachments[0].url, 'https://files.oaiusercontent.com/receipt.pdf');
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_id, 2);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_file_id, 2);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_asset_pointer, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_resolved_asset_pointer, 1);
+});
+
+test('attachment resolver stops at the first successful id candidate', async () => {
+  const harness = createPageExportHarness({
+    id: 'logical-id', file_id: 'later-file-id', asset_pointer: 'later-asset-pointer',
+    name: 'receipt.pdf', mime_type: 'application/pdf',
+  }, (_url, _call, jsonResponse) => jsonResponse({ download_url: 'https://files.oaiusercontent.com/receipt.pdf' }));
+  const result = await harness.pageExport();
+  assert.equal(harness.endpointCalls.length, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_id, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_file_id, 0);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_asset_pointer, 0);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_resolved_id, 1);
+});
+
+test('resolver candidates duplicated after fileIdOf are attempted once', async () => {
+  const harness = createPageExportHarness({
+    id: 'file-service://same-normalized-id',
+    file_id: 'same-normalized-id',
+    asset_pointer: 'sediment://same-normalized-id',
+    name: 'receipt.pdf', mime_type: 'application/pdf',
+  }, (_url, _call, jsonResponse) => jsonResponse({ download_url: 'https://files.oaiusercontent.com/receipt.pdf' }));
+  const result = await harness.pageExport();
+  assert.equal(harness.endpointCalls.length, 1);
+  assert.equal(result.attachments[0].attachmentKey, 'same-normalized-id');
+  assert.equal(result.attachmentResolverDiagnostics.candidate_present_id, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_present_file_id, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_present_asset_pointer, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_id, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_file_id, 0);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_asset_pointer, 0);
+});
+
+test('PDF fallback keeps preview association and replaces the omitted attachment placeholder', async () => {
+  const previewURL = 'https://files.oaiusercontent.com/preview.png';
+  const pdfURL = 'https://files.oaiusercontent.com/private-signed-receipt.pdf';
+  const harness = createPageExportHarness({
+    id: 'logical-pdf-key', file_id: 'working-pdf-candidate', asset_pointer: 'unused-pdf-candidate',
+    name: 'receipt.pdf', mime_type: 'application/pdf',
+  }, (url, _call, jsonResponse) => {
+    if (url.includes('preview-image-id')) return jsonResponse({ download_url: previewURL, mime_type: 'image/png' });
+    if (url.includes('logical-pdf-key')) return jsonResponse({}, { ok: false, status: 403 });
+    if (url === '/backend-api/files/download/working-pdf-candidate') return jsonResponse({ download_url: pdfURL, mime_type: 'application/pdf' });
+    throw new Error('unexpected resolver candidate or endpoint');
+  }, 'preview-image-id');
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].previewAttachmentId, 'logical-pdf-key');
+  assert.equal(result.attachments[0].attachmentKey, 'logical-pdf-key');
+  assert.equal(result.attachments[0].url, pdfURL);
+
+  const helpers = loadHelpers(async (url) => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => url === pdfURL ? 'application/pdf' : 'image/png' },
+    arrayBuffer: async () => new Uint8Array([37, 80, 68, 70]).buffer,
+  }));
+  const fetchedAttachments = await helpers.fetchAttachmentsForArchive(result.attachments, null);
+  assert.equal(fetchedAttachments.failed, 0);
+  assert.equal(fetchedAttachments.files[0].attachmentKey, 'logical-pdf-key');
+  const imageSelection = helpers.excludeSuccessfulPDFPreviews(result.images, fetchedAttachments.files);
+  assert.equal(imageSelection.images.length, 0);
+  assert.equal(imageSelection.skipped.length, 1);
+  const markdown = result.turns.map((turn) => turn.md).join('\n');
+  const linked = helpers.linkDownloadedAttachments(markdown, result.attachments, fetchedAttachments.files);
+  const output = helpers.markSkippedPDFPreviews(linked, imageSelection.skipped, fetchedAttachments.files);
+  assert.match(output, /\[receipt\.pdf\]\(attachments\/receipt\.pdf\)/);
+  assert.match(output, /PDF page preview omitted; original PDF: receipt\.pdf/);
+  const fetchedImages = await helpers.fetchImagesForArchive(imageSelection.images, null);
+  assert.equal(fetchedImages.failed, 0);
 });
 
 test('attachment resolver recognizes top-level and metadata download URLs', async (t) => {
@@ -380,18 +519,42 @@ test('attachment resolver distinguishes timeout, network, and HTML without a URL
   });
   const result = await harness.pageExport();
   const diagnostics = result.attachmentResolverDiagnostics;
-  assert.equal(diagnostics.attempts, 2);
-  assert.equal(diagnostics.endpoint_1_timeout, 1);
+  assert.equal(diagnostics.attempts, 3);
+  assert.equal(diagnostics.endpoint_1_timeout, 2);
   assert.equal(diagnostics.endpoint_2_html_no_url, 1);
-  assert.equal(diagnostics.timeout, 1);
+  assert.equal(diagnostics.timeout, 2);
   assert.equal(diagnostics.html_no_url, 1);
 
   const networkHarness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, () => {
     throw new TypeError('private network detail');
   });
   const networkResult = await networkHarness.pageExport();
-  assert.equal(networkResult.attachmentResolverDiagnostics.network, 2);
+  assert.equal(networkResult.attachmentResolverDiagnostics.attempts, 4);
+  assert.equal(networkResult.attachmentResolverDiagnostics.network, 4);
   assert.equal(networkResult.attachmentResolverDiagnostics.timeout, 0);
+});
+
+test('attachment resolver retries transient HTTP failures on the same endpoint before resolving', async () => {
+  let endpointOneCalls = 0;
+  const harness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, (url, _call, jsonResponse) => {
+    if (url !== '/backend-api/files/download/pdf-id') throw new Error('resolver advanced before bounded retries completed');
+    endpointOneCalls++;
+    if (endpointOneCalls === 1) return jsonResponse({}, {
+      ok: false,
+      status: 429,
+      headers: { get: (name) => name === 'retry-after' ? '0.001' : 'application/json' },
+    });
+    if (endpointOneCalls === 2) return jsonResponse({}, { ok: false, status: 503 });
+    return jsonResponse({ download_url: 'https://files.oaiusercontent.com/receipt.pdf' });
+  });
+  const result = await harness.pageExport();
+  assert.equal(endpointOneCalls, 3);
+  assert.equal(harness.endpointCalls.length, 3);
+  assert.equal(result.attachmentResolverDiagnostics.attempts, 3);
+  assert.equal(result.attachmentResolverDiagnostics.http_429, 1);
+  assert.equal(result.attachmentResolverDiagnostics.http_5xx, 1);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_attempt_id, 3);
+  assert.equal(result.attachmentResolverDiagnostics.candidate_resolved_id, 1);
 });
 
 test('attachment resolver classifies redirects and valid non-HTML responses', async (t) => {
@@ -447,7 +610,7 @@ test('page export discovers original PDF metadata and associates its rendered pa
   const result = await vm.runInContext('pageExport(true, true)', context);
   assert.equal(result.images[0].previewAttachmentId, 'pdf-id');
   assert.equal(result.attachments.length, 1);
-  assert.equal(result.attachments[0].fileId, 'pdf-id');
+  assert.equal(result.attachments[0].attachmentKey, 'pdf-id');
   assert.equal(result.attachments[0].name, 'receipt.pdf');
   assert.equal(result.token, 'transient-secret-token');
 });

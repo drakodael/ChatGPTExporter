@@ -113,6 +113,26 @@ async function pageExport(includeImages, includeAttachments) {
       id_source_file_id: 0,
       id_source_asset_pointer: 0,
     };
+    const attachmentCandidateDiagnostics = Object.fromEntries(
+      ["present", "attempt", "resolved"].flatMap((phase) =>
+        ["id", "file_id", "asset_pointer"].map((source) => [`candidate_${phase}_${source}`, 0])
+      )
+    );
+
+    function collectAttachmentResolverCandidates(attachment) {
+      const candidates = [];
+      const presentSources = [];
+      const seenCandidates = new Set();
+      for (const source of ["id", "file_id", "asset_pointer"]) {
+        const value = fileIdOf(attachment && attachment[source]);
+        if (!value) continue;
+        presentSources.push(source);
+        if (seenCandidates.has(value)) continue;
+        seenCandidates.add(value);
+        candidates.push({ value, source });
+      }
+      return { candidates, presentSources };
+    }
 
     function rememberImage(fid, previewAttachmentId) {
       if (!fid || imageSeen.has(fid)) return;
@@ -127,14 +147,15 @@ async function pageExport(includeImages, includeAttachments) {
       for (const attachment of attachments) {
         if (!attachment || typeof attachment !== "object") continue;
         if (String(attachment.mime_type || "").toLowerCase().startsWith("image/")) continue;
-        const source = attachment.id ? "id" : attachment.file_id ? "file_id" : attachment.asset_pointer ? "asset_pointer" : null;
-        const pointer = source ? attachment[source] : null;
-        const fileId = fileIdOf(pointer);
-        if (!fileId || attachmentSeen.has(fileId)) continue;
-        attachmentSeen.add(fileId);
-        attachmentIdSourceDiagnostics[`id_source_${source}`]++;
+        const { candidates, presentSources } = collectAttachmentResolverCandidates(attachment);
+        const attachmentKey = candidates.length ? candidates[0].value : null;
+        if (!attachmentKey || attachmentSeen.has(attachmentKey)) continue;
+        attachmentSeen.add(attachmentKey);
+        for (const source of presentSources) attachmentCandidateDiagnostics[`candidate_present_${source}`]++;
+        attachmentIdSourceDiagnostics[`id_source_${candidates[0].source}`]++;
         attachmentOrder.push({
-          fileId,
+          attachmentKey,
+          resolverCandidates: candidates,
           name: typeof attachment.name === "string" ? attachment.name : "",
           mime: typeof attachment.mime_type === "string" ? attachment.mime_type : "",
         });
@@ -148,7 +169,7 @@ async function pageExport(includeImages, includeAttachments) {
         ? ((message.metadata && message.metadata.attachments) || []).filter((a) => a && /pdf/i.test(a.mime_type || a.name || ""))
         : [];
       const previewAttachmentId = pdfAttachments.length
-        ? fileIdOf(pdfAttachments[0].id || pdfAttachments[0].file_id || pdfAttachments[0].asset_pointer)
+        ? (collectAttachmentResolverCandidates(pdfAttachments[0]).candidates[0] || {}).value || null
         : null;
 
       if (typeof content.text === "string") return content.text;
@@ -407,6 +428,7 @@ async function pageExport(includeImages, includeAttachments) {
         resolverOutcomeKeys.map((key) => [`endpoint_${endpointNumber}_${key}`, 0])
       )),
       ...attachmentIdSourceDiagnostics,
+      ...attachmentCandidateDiagnostics,
     };
 
     function recordAttachmentResolverOutcome(key, endpointNumber) {
@@ -418,62 +440,99 @@ async function pageExport(includeImages, includeAttachments) {
     if (includeAttachments) {
       for (const attachment of attachmentOrder) {
         let found = null;
-        const endpoints = [
-          `/backend-api/files/download/${encodeURIComponent(attachment.fileId)}`,
-          `/backend-api/files/${encodeURIComponent(attachment.fileId)}/download`,
-        ];
-        for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
-          const endpoint = endpoints[endpointIndex];
-          const endpointNumber = endpointIndex + 1;
-          attachmentResolverDiagnostics.attempts++;
-          attachmentResolverDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
-          try {
-            const response = await fetchWithTimeout(endpoint, auth, 20000);
-            if (!response.ok) {
-              const status = response.status;
-              const key = status === 401 ? "http_401" : status === 403 ? "http_403" : status === 404 ? "http_404" : status === 429 ? "http_429" : status >= 500 ? "http_5xx" : "http_other";
-              attachmentDiagnostics[key]++;
-              recordAttachmentResolverOutcome(key, endpointNumber);
-              continue;
-            }
-            const type = (response.headers.get("content-type") || "").toLowerCase();
-            if (type.includes("application/json")) {
-              const payload = await response.json();
-              const directURL = payload && payload.download_url;
-              const metadataURL = payload && payload.metadata && payload.metadata.download_url;
-              const url = directURL || metadataURL;
-              if (url) {
-                recordAttachmentResolverOutcome(directURL ? "json_download_url" : "json_metadata_download_url", endpointNumber);
-                found = {
-                  fileId: attachment.fileId,
-                  url,
-                  name: (payload.metadata && (payload.metadata.file_name || payload.metadata.name)) || payload.file_name || attachment.name,
-                  mime: (payload.metadata && payload.metadata.mime_type) || payload.mime_type || attachment.mime,
-                };
+        let resolvedSource = null;
+        for (const candidate of attachment.resolverCandidates) {
+          const endpoints = [
+            `/backend-api/files/download/${encodeURIComponent(candidate.value)}`,
+            `/backend-api/files/${encodeURIComponent(candidate.value)}/download`,
+          ];
+          for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
+            const endpoint = endpoints[endpointIndex];
+            const endpointNumber = endpointIndex + 1;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              attachmentResolverDiagnostics.attempts++;
+              attachmentResolverDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
+              attachmentResolverDiagnostics[`candidate_attempt_${candidate.source}`]++;
+              try {
+                const response = await fetchWithTimeout(endpoint, auth, 20000);
+                if (!response.ok) {
+                  const status = response.status;
+                  const key = status === 401 ? "http_401" : status === 403 ? "http_403" : status === 404 ? "http_404" : status === 429 ? "http_429" : status >= 500 ? "http_5xx" : "http_other";
+                  attachmentDiagnostics[key]++;
+                  recordAttachmentResolverOutcome(key, endpointNumber);
+                  if ((status === 429 || status >= 500) && attempt < 2) {
+                    const retryAfter = Number(response.headers.get("retry-after")) || 0;
+                    await sleep(Math.min((retryAfter || 2) * 1000 * (attempt + 1), 10000));
+                    continue;
+                  }
+                  break;
+                }
+
+                const type = (response.headers.get("content-type") || "").toLowerCase();
+                if (type.includes("application/json")) {
+                  const payload = await response.json();
+                  const directURL = payload && payload.download_url;
+                  const metadataURL = payload && payload.metadata && payload.metadata.download_url;
+                  const url = directURL || metadataURL;
+                  if (url) {
+                    recordAttachmentResolverOutcome(directURL ? "json_download_url" : "json_metadata_download_url", endpointNumber);
+                    found = {
+                      attachmentKey: attachment.attachmentKey,
+                      url,
+                      name: (payload.metadata && (payload.metadata.file_name || payload.metadata.name)) || payload.file_name || attachment.name,
+                      mime: (payload.metadata && payload.metadata.mime_type) || payload.mime_type || attachment.mime,
+                    };
+                    resolvedSource = candidate.source;
+                    break;
+                  }
+                  attachmentDiagnostics.no_url++;
+                  recordAttachmentResolverOutcome("json_no_url", endpointNumber);
+                  break;
+                }
+
+                if (response.redirected || !type.includes("text/html")) {
+                  try { if (response.body) response.body.cancel(); } catch (_) {}
+                  recordAttachmentResolverOutcome(response.redirected ? "redirect" : "non_html_response", endpointNumber);
+                  found = {
+                    attachmentKey: attachment.attachmentKey,
+                    url: response.url || endpoint,
+                    name: attachment.name,
+                    mime: attachment.mime,
+                  };
+                  resolvedSource = candidate.source;
+                  break;
+                }
+
+                attachmentDiagnostics.no_url++;
+                recordAttachmentResolverOutcome("html_no_url", endpointNumber);
+                break;
+              } catch (error) {
+                attachmentDiagnostics.network++;
+                const outcome = error && error.name === "AbortError" ? "timeout" : "network";
+                recordAttachmentResolverOutcome(outcome, endpointNumber);
+                if (attempt < 1) {
+                  await sleep(1000);
+                  continue;
+                }
                 break;
               }
-              attachmentDiagnostics.no_url++;
-              recordAttachmentResolverOutcome("json_no_url", endpointNumber);
-            } else if (response.redirected || !type.includes("text/html")) {
-              try { if (response.body) response.body.cancel(); } catch (_) {}
-              recordAttachmentResolverOutcome(response.redirected ? "redirect" : "non_html_response", endpointNumber);
-              found = { ...attachment, url: response.url || endpoint };
-              break;
-            } else {
-              attachmentDiagnostics.no_url++;
-              recordAttachmentResolverOutcome("html_no_url", endpointNumber);
             }
-          } catch (error) {
-            attachmentDiagnostics.network++;
-            recordAttachmentResolverOutcome(error && error.name === "AbortError" ? "timeout" : "network", endpointNumber);
+            if (found) break;
           }
+          if (found) break;
         }
         if (found) {
           attachmentDiagnostics.resolved++;
           attachmentResolverDiagnostics.resolved++;
+          attachmentResolverDiagnostics[`candidate_resolved_${resolvedSource}`]++;
           attachments.push(found);
         } else {
-          attachments.push({ ...attachment, url: null });
+          attachments.push({
+            attachmentKey: attachment.attachmentKey,
+            name: attachment.name,
+            mime: attachment.mime,
+            url: null,
+          });
         }
       }
     }

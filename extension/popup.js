@@ -479,7 +479,7 @@ async function fetchAttachmentsForArchive(attachments, accessToken) {
       continue;
     }
     const name = safeAttachmentName(attachment.name, index + 1, outcome.contentType || attachment.mime);
-    files.push({ fileId: attachment.fileId, name, bytes: outcome.bytes });
+    files.push({ attachmentKey: attachment.attachmentKey, name, bytes: outcome.bytes });
     diagnostics[usedAuth ? "auth_ok" : "direct_ok"]++;
   }
   return { files, failed, diagnostics };
@@ -494,6 +494,7 @@ function buildExportReport(imageResult, attachmentResult, hadToken, attachmentRe
     "network", "timeout", "json_download_url", "json_metadata_download_url",
     "json_no_url", "redirect", "non_html_response", "html_no_url",
   ];
+  const candidateSources = ["id", "file_id", "asset_pointer"];
   return [
     "ChatGPT Local Exporter - file export report", "Version: 2.9-private", "",
     `Images detected: ${images.detected || 0}`,
@@ -513,6 +514,9 @@ function buildExportReport(imageResult, attachmentResult, hadToken, attachmentRe
     `attachment-id_source-id: ${resolver.id_source_id || 0}`,
     `attachment-id_source-file_id: ${resolver.id_source_file_id || 0}`,
     `attachment-id_source-asset_pointer: ${resolver.id_source_asset_pointer || 0}`,
+    ...candidateSources.map((source) => `attachment-candidate-present-${source}: ${resolver[`candidate_present_${source}`] || 0}`),
+    ...candidateSources.map((source) => `attachment-candidate-attempt-${source}: ${resolver[`candidate_attempt_${source}`] || 0}`),
+    ...candidateSources.map((source) => `attachment-candidate-resolved-${source}: ${resolver[`candidate_resolved_${source}`] || 0}`),
     `attachment-resolver-attempts: ${resolver.attempts || 0}`,
     `attachment-resolver-resolved: ${resolver.resolved || 0}`,
     ...resolverOutcomeKeys.map((key) => `attachment-resolver-${key}: ${resolver[key] || 0}`),
@@ -640,7 +644,7 @@ function uniqueAttachmentArchiveNames(attachments) {
     let suffix = 2;
     while (usedNames.has(name)) name = `${stem}-${suffix++}${ext}`;
     usedNames.add(name);
-    names.set(attachment.fileId, name);
+    names.set(attachment.attachmentKey, name);
   }
   return names;
 }
@@ -648,27 +652,27 @@ function uniqueAttachmentArchiveNames(attachments) {
 function addAttachmentsToArchive(entries, attachments) {
   const names = uniqueAttachmentArchiveNames(attachments);
   for (const attachment of attachments || []) {
-    const name = names.get(attachment && attachment.fileId);
+    const name = names.get(attachment && attachment.attachmentKey);
     if (name) entries.push({ name: `attachments/${name}`, data: attachment.bytes });
   }
 }
 
 function linkDownloadedAttachments(markdown, descriptors, files) {
-  const byId = new Map((files || []).map((file) => [file.fileId, file]));
+  const byId = new Map((files || []).map((file) => [file.attachmentKey, file]));
   const archiveNames = uniqueAttachmentArchiveNames(files);
   let output = markdown;
   for (const descriptor of descriptors || []) {
-    const file = byId.get(descriptor.fileId);
+    const file = byId.get(descriptor.attachmentKey);
     if (!file) continue;
     const label = descriptor.name || file.name;
-    const archiveName = archiveNames.get(file.fileId) || file.name;
+    const archiveName = archiveNames.get(file.attachmentKey) || file.name;
     output = replaceAllLiteral(output, `_[attachment omitted: ${label}]_`, `[${label.replace(/\]/g, "\\]")}](attachments/${archiveName})`);
   }
   return output;
 }
 
 function markSkippedPDFPreviews(markdown, skipped, downloadedAttachments) {
-  const files = new Map((downloadedAttachments || []).map((file) => [file.fileId, file]));
+  const files = new Map((downloadedAttachments || []).map((file) => [file.attachmentKey, file]));
   let output = markdown;
   for (const image of skipped || []) {
     const attachment = files.get(image.previewAttachmentId);
@@ -680,7 +684,7 @@ function markSkippedPDFPreviews(markdown, skipped, downloadedAttachments) {
 }
 
 function excludeSuccessfulPDFPreviews(images, downloadedAttachments) {
-  const downloadedIds = new Set((downloadedAttachments || []).map((file) => file && file.fileId).filter(Boolean));
+  const downloadedIds = new Set((downloadedAttachments || []).map((file) => file && file.attachmentKey).filter(Boolean));
   const skipped = [];
   const remaining = [];
   for (const image of images || []) {
