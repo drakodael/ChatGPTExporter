@@ -175,3 +175,36 @@ Then load this folder as the Safari temporary extension:
 - `feature/image-export`: experimental image work
 - do not merge to `main` until v2.3 or a later revision successfully exports real image files
 - backup folders created by patch scripts should remain local and should not be committed
+
+
+### v2.4 — persistent diagnostics inside the ZIP
+
+Safari closes the extension popup when the download UI appears, so the final diagnostic message cannot be read reliably.
+
+v2.4 adds a privacy-safe `export-report.txt` inside every image-export ZIP. It contains aggregate counts only:
+
+- images detected
+- images with a resolved URL
+- images downloaded
+- images failed
+- direct signed-URL downloads
+- authenticated downloads
+- whether a transient session token was available
+- failure totals for no-url, invalid-host, 401, 403, 404, 429, 5xx, other HTTP, content-type, and network
+
+The report does **not** contain:
+
+- the ChatGPT access token
+- signed image URLs
+- image file IDs
+- message text
+
+This makes the next Safari test diagnosable even if the popup disappears during download.
+
+Test the branch, then inspect:
+
+```bash
+unzip -p Unknown export-report.txt
+```
+
+or upload the resulting ZIP for inspection.
