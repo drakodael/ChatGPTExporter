@@ -5,7 +5,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync('extension/popup.js', 'utf8');
 
-function loadHelpers() {
+function loadHelpers(fetchImpl) {
   const elements = new Map();
   const context = {
     document: {
@@ -23,16 +23,16 @@ function loadHelpers() {
     Map,
     Set,
     Date,
-    fetch: async () => ({
+    fetch: fetchImpl || (async () => ({
       ok: true,
       status: 200,
       headers: { get: () => 'image/png' },
       arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer,
-    }),
+    })),
     console,
   };
   vm.createContext(context);
-  vm.runInContext(`${source}\nthis.testAPI = { safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive };`, context);
+  vm.runInContext(`${source}\nthis.testAPI = { safeAttachmentName, buildExportReport, buildArchiveMarkdown, addAttachmentsToArchive, excludeSuccessfulPDFPreviews, linkDownloadedAttachments, markSkippedPDFPreviews, fetchImagesForArchive, fetchAttachmentsForArchive };`, context);
   return context.testAPI;
 }
 
@@ -52,7 +52,10 @@ test('report separates image and attachment totals and contains no identifiers o
   assert.match(report, /Images failed: 1/);
   assert.match(report, /Attachments detected: 1/);
   assert.match(report, /Attachments downloaded: 1/);
-  assert.doesNotMatch(report, /Bearer|https?:\/\/|file-id-123|signed-url/);
+  assert.match(report, /attachment-content_type: 0/);
+  assert.match(report, /image-network: 0/);
+  assert.match(report, /Version: 2\.9-private/);
+  assert.doesNotMatch(report, /Bearer|https?:\/\/|file-id-123|signed-url|transient-secret-token/);
 });
 
 test('successful original attachment is archived separately from image entries', () => {
@@ -91,6 +94,24 @@ test('existing signed-image download path still saves image bytes locally', asyn
   assert.deepEqual([...result.files.get('img-1').bytes], [7, 8, 9]);
 });
 
+test('original PDF bytes are exported while image payloads are rejected as attachments', async () => {
+  const { fetchAttachmentsForArchive } = loadHelpers(async (url) => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => url.endsWith('.pdf') ? 'application/pdf' : 'image/png' },
+    arrayBuffer: async () => new Uint8Array([37, 80, 68, 70]).buffer,
+  }));
+  const result = await fetchAttachmentsForArchive([
+    { fileId: 'pdf-id', name: 'receipt.pdf', mime: 'application/pdf', url: 'https://files.oaiusercontent.com/receipt.pdf' },
+    { fileId: 'image-id', name: 'photo.png', mime: 'image/png', url: 'https://files.oaiusercontent.com/photo.png' },
+  ], null);
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].name, 'receipt.pdf');
+  assert.deepEqual([...result.files[0].bytes], [37, 80, 68, 70]);
+  assert.equal(result.failed, 1);
+  assert.equal(result.diagnostics.content_type, 1);
+});
+
 test('successful original PDF export excludes its rendered preview from image failures', () => {
   const { excludeSuccessfulPDFPreviews } = loadHelpers();
   const result = excludeSuccessfulPDFPreviews([
@@ -115,7 +136,10 @@ test('page export discovers original PDF metadata and associates its rendered pa
       if (url.startsWith('/backend-api/conversation/')) return jsonResponse({
         title: 'PDF chat', current_node: 'node-1', mapping: { 'node-1': { parent: null, message: {
           author: { role: 'user' }, content: { parts: [{ content_type: 'image_asset_pointer', asset_pointer: 'file-service://preview-id' }] },
-          metadata: { attachments: [{ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }] },
+          metadata: { attachments: [
+            { id: 'image-attachment-id', name: 'photo.png', mime_type: 'image/png' },
+            { id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' },
+          ] },
         } } },
       });
       if (url.includes('preview-id')) return jsonResponse({ download_url: 'https://files.oaiusercontent.com/preview.png', mime_type: 'image/png' });
@@ -127,6 +151,7 @@ test('page export discovers original PDF metadata and associates its rendered pa
   vm.runInContext(fs.readFileSync('extension/exporter.js', 'utf8'), context);
   const result = await vm.runInContext('pageExport(true, true)', context);
   assert.equal(result.images[0].previewAttachmentId, 'pdf-id');
+  assert.equal(result.attachments.length, 1);
   assert.equal(result.attachments[0].fileId, 'pdf-id');
   assert.equal(result.attachments[0].name, 'receipt.pdf');
   assert.equal(result.token, 'transient-secret-token');

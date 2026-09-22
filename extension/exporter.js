@@ -121,6 +121,7 @@ async function pageExport(includeImages, includeAttachments) {
       const attachments = (message.metadata && message.metadata.attachments) || [];
       for (const attachment of attachments) {
         if (!attachment || typeof attachment !== "object") continue;
+        if (String(attachment.mime_type || "").toLowerCase().startsWith("image/")) continue;
         const pointer = attachment.file_id || attachment.id || attachment.asset_pointer;
         const fileId = fileIdOf(pointer);
         if (!fileId || attachmentSeen.has(fileId)) continue;
@@ -198,7 +199,7 @@ async function pageExport(includeImages, includeAttachments) {
       const names = attachments
         .filter((a) => {
           if (!a) return false;
-          if (includeImages && String(a.mime_type || "").startsWith("image/")) return false;
+          if (String(a.mime_type || "").toLowerCase().startsWith("image/")) return false;
           return true;
         })
         .map((a) => a && a.name)

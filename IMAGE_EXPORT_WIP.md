@@ -234,6 +234,32 @@ node --check extension/exporter.js
 node --check extension/popup.js
 ```
 
+### v2.9 — exclude image attachments and validate original files
+
+V2.9 keeps image export unchanged while excluding every metadata attachment
+whose MIME type is `image/*` from the original-attachment list and omitted-file
+placeholders. This prevents image bytes from being duplicated under
+`attachments/`. The attachment downloader also rejects image payloads returned
+for a non-image descriptor; actual PDFs and other non-image files remain
+eligible for `attachments/` and their successfully downloaded placeholders are
+replaced with relative Markdown links.
+
+The known regression (128 PNG files incorrectly saved in `attachments/` for
+one PDF chat) now collects only the PDF descriptor. When that PDF is downloaded,
+its associated page-preview pointers are excluded from image download/failure
+totals. Reports are versioned `2.9-private`, keep image and attachment totals
+and diagnostics separate, and contain aggregate data only. Normal permissions
+remain exactly `activeTab` and `scripting`; no persistent token storage,
+analytics, or additional normal permissions are introduced.
+
+Run focused checks with:
+
+```bash
+node --test tests/export-attachments.test.js
+node --check extension/exporter.js
+node --check extension/popup.js
+```
+
 
 ### v2.6 — allow the actual ChatGPT image endpoint
 

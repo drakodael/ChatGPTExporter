@@ -361,7 +361,7 @@ async function fetchAttachmentsForArchive(attachments, accessToken) {
         });
         if (!response.ok) return { reason: "http", status: response.status };
         const contentType = response.headers.get("content-type") || attachment.mime || "application/octet-stream";
-        if (/text\/html/i.test(contentType)) return { reason: "content_type" };
+        if (/^(?:image\/|text\/html)/i.test(contentType)) return { reason: "content_type" };
         return { bytes: new Uint8Array(await response.arrayBuffer()), contentType };
       } catch (_) { return { reason: "network" }; }
     };
@@ -388,7 +388,7 @@ function buildExportReport(imageResult, attachmentResult, hadToken) {
   const images = imageResult || {};
   const attachments = attachmentResult || {};
   return [
-    "ChatGPT Local Exporter - file export report", "Version: 2.8-private", "",
+    "ChatGPT Local Exporter - file export report", "Version: 2.9-private", "",
     `Images detected: ${images.detected || 0}`,
     `Images downloaded: ${images.downloaded || 0}`,
     `Images failed: ${images.failed || 0}`, "",
@@ -400,7 +400,8 @@ function buildExportReport(imageResult, attachmentResult, hadToken) {
     `Attachment direct downloads: ${(attachments.diagnostics && attachments.diagnostics.direct_ok) || 0}`,
     `Attachment authenticated downloads: ${(attachments.diagnostics && attachments.diagnostics.auth_ok) || 0}`,
     `Transient session token available: ${hadToken ? "yes" : "no"}`, "",
-    "Attachment failure categories:", ...["no_url", "invalid_host", "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other", "content_type", "network"].map((key) => `${key}: ${(attachments.diagnostics && attachments.diagnostics[key]) || 0}`), "",
+    "Attachment diagnostics (aggregate only):",
+    ...["direct_ok", "auth_ok", "no_url", "invalid_host", "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other", "content_type", "network"].map((key) => `attachment-${key}: ${(attachments.diagnostics && attachments.diagnostics[key]) || 0}`), "",
     "Privacy:", "- Aggregate counts only; no token, signed URL, or file ID is included.", "",
   ].join("\n");
 }
