@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Local Exporter",
-  "version": "2.4-private",
-  "description": "Export the active ChatGPT conversation to local Markdown, optionally with images in a ZIP. Image CDN access is optional. Image exports include a privacy-safe aggregate export-report.txt so Safari popup closure cannot hide diagnostics. The ChatGPT session token may be held transiently in extension memory for authenticated OpenAI CDN retries; it is never persisted.",
+  "version": "2.5-diagnostic",
+  "description": "Diagnostic image-export build. Adds only rejected CDN hostnames to export-report.txt so image host permissions can be corrected without recording signed URLs, paths, file IDs, or tokens.",
   "icons": {
     "48": "images/icon-48.png",
     "96": "images/icon-96.png",
