@@ -1012,3 +1012,93 @@ test('image resolver stops after conversation-scoped 403s when no extra auth con
   assert.equal(result.resolutionDiagnostics.project_context_attempts, 0);
   assert.equal(harness.endpointCalls.length, 4);
 });
+
+
+test('unresolved image diagnostics correlate same-message image attachment candidates without exposing values', async () => {
+  const imagePointer = 'private-image-pointer';
+  const alternateId = 'private-alternate-image-attachment-id';
+  const privateName = 'private-uploaded-image-name.png';
+  const harness = createPageExportHarness(
+    [
+      {
+        id: alternateId,
+        file_id: imagePointer,
+        asset_pointer: 'file-service://private-third-candidate',
+        name: privateName,
+        mime_type: 'image/png',
+      },
+    ],
+    (_url, _call, jsonResponse) => jsonResponse({}, { ok: false, status: 403 }),
+    imagePointer
+  );
+
+  const result = await harness.pageExport(true);
+  const d = result.unresolvedImageAttachmentDiagnostics;
+  assert.equal(result.images[0].url, null);
+  assert.equal(d.same_message_image_attachments, 1);
+  assert.equal(d.with_one_image_attachment, 1);
+  assert.equal(d.with_multiple_image_attachments, 0);
+  assert.equal(d.attachment_candidate_id_present, 1);
+  assert.equal(d.attachment_candidate_file_id_present, 1);
+  assert.equal(d.attachment_candidate_asset_pointer_present, 1);
+  assert.equal(d.pointer_matches_attachment_id, 0);
+  assert.equal(d.pointer_matches_attachment_file_id, 1);
+  assert.equal(d.pointer_matches_attachment_asset_pointer, 0);
+  assert.equal(d.has_distinct_alternate_candidate, 1);
+
+  const report = loadHelpers().buildExportReport(
+    { detected: 1, downloaded: 0, failed: 1, diagnostics: { no_url: 1 } },
+    { detected: 0, downloaded: 0, failed: 0, diagnostics: {} },
+    true,
+    {},
+    result.resolutionDiagnostics,
+    result.imageDiscoveryDiagnostics,
+    d
+  );
+  assert.match(report, /unresolved-image-same-message-image-attachments: 1/);
+  assert.match(report, /unresolved-image-pointer-matches-attachment-file_id: 1/);
+  assert.match(report, /unresolved-image-has-distinct-alternate-candidate: 1/);
+  for (const secret of [
+    imagePointer,
+    alternateId,
+    'private-third-candidate',
+    privateName,
+    'resolver-test-bearer-secret',
+  ]) assert.equal(report.includes(secret), false);
+});
+
+test('unresolved image diagnostics distinguish multiple same-message image attachments', async () => {
+  const imagePointer = 'unresolved-image-with-multiple-attachments';
+  const harness = createPageExportHarness(
+    [
+      { id: 'image-attachment-one', name: 'one.png', mime_type: 'image/png' },
+      { id: 'image-attachment-two', name: 'two.png', mime_type: 'image/png' },
+    ],
+    (_url, _call, jsonResponse) => jsonResponse({}, { ok: false, status: 403 }),
+    imagePointer
+  );
+
+  const result = await harness.pageExport(true);
+  const d = result.unresolvedImageAttachmentDiagnostics;
+  assert.equal(d.same_message_image_attachments, 1);
+  assert.equal(d.with_one_image_attachment, 0);
+  assert.equal(d.with_multiple_image_attachments, 1);
+  assert.equal(d.attachment_candidate_id_present, 1);
+  assert.equal(d.has_distinct_alternate_candidate, 1);
+});
+
+test('resolved images do not contribute to unresolved attachment-correlation diagnostics', async () => {
+  const imagePointer = 'resolved-image-pointer';
+  const harness = createPageExportHarness(
+    [{ id: 'alternate-image-id', name: 'photo.png', mime_type: 'image/png' }],
+    (_url, _call, jsonResponse) => jsonResponse({ download_url: 'https://files.oaiusercontent.com/resolved.png' }),
+    imagePointer
+  );
+
+  const result = await harness.pageExport(true);
+  const d = result.unresolvedImageAttachmentDiagnostics;
+  assert.ok(result.images[0].url);
+  assert.equal(d.same_message_image_attachments, 0);
+  assert.equal(d.attachment_candidate_id_present, 0);
+  assert.equal(d.has_distinct_alternate_candidate, 0);
+});

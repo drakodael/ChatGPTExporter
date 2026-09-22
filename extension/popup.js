@@ -485,12 +485,13 @@ async function fetchAttachmentsForArchive(attachments, accessToken) {
   return { files, failed, diagnostics };
 }
 
-function buildExportReport(imageResult, attachmentResult, hadToken, attachmentResolverDiagnostics, imageResolverDiagnostics, imageDiscoveryDiagnostics) {
+function buildExportReport(imageResult, attachmentResult, hadToken, attachmentResolverDiagnostics, imageResolverDiagnostics, imageDiscoveryDiagnostics, unresolvedImageAttachmentDiagnostics) {
   const images = imageResult || {};
   const attachments = attachmentResult || {};
   const resolver = attachmentResolverDiagnostics || {};
   const imageResolver = imageResolverDiagnostics || {};
   const imageDiscovery = imageDiscoveryDiagnostics || {};
+  const unresolvedImageAttachments = unresolvedImageAttachmentDiagnostics || {};
   const imageResolverOutcomeKeys = [
     "success_json", "success_response", "json_no_url", "html_rejected",
     "http_401", "http_403", "http_404", "http_429", "http_5xx", "http_other",
@@ -549,6 +550,17 @@ function buildExportReport(imageResult, attachmentResult, hadToken, attachmentRe
       `image-resolver-endpoint_${endpointNumber}-project_context-http_403: ${imageResolver[`endpoint_${endpointNumber}_project_context_http_403`] || 0}`,
       ...imageResolverOutcomeKeys.map((key) => `image-resolver-endpoint_${endpointNumber}-${key}: ${imageResolver[`endpoint_${endpointNumber}_${key}`] || 0}`),
     ]), "",
+    "Unresolved image attachment correlation (aggregate only):",
+    `unresolved-image-same-message-image-attachments: ${unresolvedImageAttachments.same_message_image_attachments || 0}`,
+    `unresolved-image-with-one-image-attachment: ${unresolvedImageAttachments.with_one_image_attachment || 0}`,
+    `unresolved-image-with-multiple-image-attachments: ${unresolvedImageAttachments.with_multiple_image_attachments || 0}`,
+    `unresolved-image-attachment-candidate-id-present: ${unresolvedImageAttachments.attachment_candidate_id_present || 0}`,
+    `unresolved-image-attachment-candidate-file_id-present: ${unresolvedImageAttachments.attachment_candidate_file_id_present || 0}`,
+    `unresolved-image-attachment-candidate-asset_pointer-present: ${unresolvedImageAttachments.attachment_candidate_asset_pointer_present || 0}`,
+    `unresolved-image-pointer-matches-attachment-id: ${unresolvedImageAttachments.pointer_matches_attachment_id || 0}`,
+    `unresolved-image-pointer-matches-attachment-file_id: ${unresolvedImageAttachments.pointer_matches_attachment_file_id || 0}`,
+    `unresolved-image-pointer-matches-attachment-asset_pointer: ${unresolvedImageAttachments.pointer_matches_attachment_asset_pointer || 0}`,
+    `unresolved-image-has-distinct-alternate-candidate: ${unresolvedImageAttachments.has_distinct_alternate_candidate || 0}`, "",
     `Attachments detected: ${attachments.detected || 0}`,
     `Attachments downloaded: ${attachments.downloaded || 0}`,
     `Attachments failed: ${attachments.failed || 0}`,
@@ -850,7 +862,8 @@ async function exportConversation(includeImages, includeAttachments, permissionP
         false,
         result.attachmentResolverDiagnostics,
         result.resolutionDiagnostics,
-        result.imageDiscoveryDiagnostics
+        result.imageDiscoveryDiagnostics,
+        result.unresolvedImageAttachmentDiagnostics
       );
       const entries = [
         {
@@ -892,7 +905,8 @@ async function exportConversation(includeImages, includeAttachments, permissionP
       !!accessToken,
       result.attachmentResolverDiagnostics,
       result.resolutionDiagnostics,
-      result.imageDiscoveryDiagnostics
+      result.imageDiscoveryDiagnostics,
+      result.unresolvedImageAttachmentDiagnostics
     );
     entries.push({
       name: "export-report.txt",

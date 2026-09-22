@@ -122,6 +122,7 @@ async function pageExport(includeImages, includeAttachments) {
     const imageOrder = [];
     const imageSeen = new Set();
     const imagePreviewAttachment = new Map();
+    const imageAttachmentContext = new Map();
     const imageDiscoveryDiagnostics = {
       source_image_asset_pointer: 0,
       pointer_normalized: 0,
@@ -158,7 +159,38 @@ async function pageExport(includeImages, includeAttachments) {
       return { candidates, presentSources };
     }
 
-    function rememberImage(fid, previewAttachmentId) {
+    function summarizeSameMessageImageAttachments(message, fid) {
+      const attachments = (message && message.metadata && message.metadata.attachments) || [];
+      const imageAttachments = attachments.filter((attachment) =>
+        attachment &&
+        typeof attachment === "object" &&
+        String(attachment.mime_type || "").toLowerCase().startsWith("image/")
+      );
+      const summary = {
+        image_attachment_count: imageAttachments.length,
+        candidate_id_present: false,
+        candidate_file_id_present: false,
+        candidate_asset_pointer_present: false,
+        pointer_matches_attachment_id: false,
+        pointer_matches_attachment_file_id: false,
+        pointer_matches_attachment_asset_pointer: false,
+        has_distinct_alternate_candidate: false,
+      };
+
+      for (const attachment of imageAttachments) {
+        for (const source of ["id", "file_id", "asset_pointer"]) {
+          const value = fileIdOf(attachment[source]);
+          if (!value) continue;
+          summary[`candidate_${source}_present`] = true;
+          if (value === fid) summary[`pointer_matches_attachment_${source}`] = true;
+          else summary.has_distinct_alternate_candidate = true;
+        }
+      }
+
+      return summary;
+    }
+
+    function rememberImage(fid, previewAttachmentId, attachmentContext) {
       if (!fid) return;
       if (imageSeen.has(fid)) {
         imageDiscoveryDiagnostics.duplicate_pointer++;
@@ -167,6 +199,7 @@ async function pageExport(includeImages, includeAttachments) {
       imageSeen.add(fid);
       imageOrder.push(fid);
       imageDiscoveryDiagnostics.unique_discovered++;
+      if (attachmentContext) imageAttachmentContext.set(fid, attachmentContext);
       if (previewAttachmentId) {
         imagePreviewAttachment.set(fid, previewAttachmentId);
         imageDiscoveryDiagnostics.preview_associated++;
@@ -221,7 +254,11 @@ async function pageExport(includeImages, includeAttachments) {
                 else imageDiscoveryDiagnostics.pointer_missing_or_invalid++;
               }
               if (includeImages && fid) {
-                rememberImage(fid, previewAttachmentId);
+                rememberImage(
+                  fid,
+                  previewAttachmentId,
+                  summarizeSameMessageImageAttachments(message, fid)
+                );
                 return `@@IMG@@${fid}@@`;
               }
               return "_[image omitted]_";
@@ -594,6 +631,45 @@ async function pageExport(includeImages, includeAttachments) {
       resolved.push(await resolveImage(fid));
     }
 
+    const unresolvedImageAttachmentDiagnostics = {
+      same_message_image_attachments: 0,
+      with_one_image_attachment: 0,
+      with_multiple_image_attachments: 0,
+      attachment_candidate_id_present: 0,
+      attachment_candidate_file_id_present: 0,
+      attachment_candidate_asset_pointer_present: 0,
+      pointer_matches_attachment_id: 0,
+      pointer_matches_attachment_file_id: 0,
+      pointer_matches_attachment_asset_pointer: 0,
+      has_distinct_alternate_candidate: 0,
+    };
+
+    for (const image of resolved) {
+      if (image && image.url) continue;
+      const context = image && image.fileId ? imageAttachmentContext.get(image.fileId) : null;
+      if (!context) continue;
+
+      if (context.image_attachment_count > 0) {
+        unresolvedImageAttachmentDiagnostics.same_message_image_attachments++;
+        if (context.image_attachment_count === 1) {
+          unresolvedImageAttachmentDiagnostics.with_one_image_attachment++;
+        } else {
+          unresolvedImageAttachmentDiagnostics.with_multiple_image_attachments++;
+        }
+      }
+      for (const source of ["id", "file_id", "asset_pointer"]) {
+        if (context[`candidate_${source}_present`]) {
+          unresolvedImageAttachmentDiagnostics[`attachment_candidate_${source}_present`]++;
+        }
+        if (context[`pointer_matches_attachment_${source}`]) {
+          unresolvedImageAttachmentDiagnostics[`pointer_matches_attachment_${source}`]++;
+        }
+      }
+      if (context.has_distinct_alternate_candidate) {
+        unresolvedImageAttachmentDiagnostics.has_distinct_alternate_candidate++;
+      }
+    }
+
     function extensionFor(image) {
       const name = image.originalName || "";
       const match = name.match(/\.([A-Za-z0-9]{2,5})$/);
@@ -621,6 +697,7 @@ async function pageExport(includeImages, includeAttachments) {
     }));
     result.resolutionDiagnostics = resolutionDiagnostics;
     result.imageDiscoveryDiagnostics = imageDiscoveryDiagnostics;
+    result.unresolvedImageAttachmentDiagnostics = unresolvedImageAttachmentDiagnostics;
 
     const attachmentDiagnostics = {
       resolved: 0, no_url: 0, http_401: 0, http_403: 0, http_404: 0,
