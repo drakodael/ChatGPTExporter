@@ -260,6 +260,22 @@ node --check extension/exporter.js
 node --check extension/popup.js
 ```
 
+### v2.9.1 — prefer metadata attachment IDs
+
+For non-image entries in `metadata.attachments`, V2.9.1 resolves the
+attachment's `id` first, using `file_id` and `asset_pointer` only as fallbacks.
+PDF page previews use the same priority when associating previews with their
+original attachment. Image export, V2.9 filtering and download behavior,
+aggregate-only diagnostics, and normal permissions remain unchanged.
+
+Run focused checks with:
+
+```bash
+node --test tests/export-attachments.test.js
+node --check extension/exporter.js
+node --check extension/popup.js
+```
+
 
 ### v2.6 — allow the actual ChatGPT image endpoint
 

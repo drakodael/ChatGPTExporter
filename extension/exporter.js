@@ -122,7 +122,7 @@ async function pageExport(includeImages, includeAttachments) {
       for (const attachment of attachments) {
         if (!attachment || typeof attachment !== "object") continue;
         if (String(attachment.mime_type || "").toLowerCase().startsWith("image/")) continue;
-        const pointer = attachment.file_id || attachment.id || attachment.asset_pointer;
+        const pointer = attachment.id || attachment.file_id || attachment.asset_pointer;
         const fileId = fileIdOf(pointer);
         if (!fileId || attachmentSeen.has(fileId)) continue;
         attachmentSeen.add(fileId);
@@ -141,7 +141,7 @@ async function pageExport(includeImages, includeAttachments) {
         ? ((message.metadata && message.metadata.attachments) || []).filter((a) => a && /pdf/i.test(a.mime_type || a.name || ""))
         : [];
       const previewAttachmentId = pdfAttachments.length
-        ? fileIdOf(pdfAttachments[0].file_id || pdfAttachments[0].id || pdfAttachments[0].asset_pointer)
+        ? fileIdOf(pdfAttachments[0].id || pdfAttachments[0].file_id || pdfAttachments[0].asset_pointer)
         : null;
 
       if (typeof content.text === "string") return content.text;

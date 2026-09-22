@@ -138,12 +138,13 @@ test('page export discovers original PDF metadata and associates its rendered pa
           author: { role: 'user' }, content: { parts: [{ content_type: 'image_asset_pointer', asset_pointer: 'file-service://preview-id' }] },
           metadata: { attachments: [
             { id: 'image-attachment-id', name: 'photo.png', mime_type: 'image/png' },
-            { id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' },
+            { id: 'pdf-id', file_id: 'wrong-file-id', asset_pointer: 'wrong-asset-pointer', name: 'receipt.pdf', mime_type: 'application/pdf' },
           ] },
         } } },
       });
       if (url.includes('preview-id')) return jsonResponse({ download_url: 'https://files.oaiusercontent.com/preview.png', mime_type: 'image/png' });
       if (url.includes('pdf-id')) return jsonResponse({ download_url: 'https://files.oaiusercontent.com/receipt.pdf', mime_type: 'application/pdf', file_name: 'receipt.pdf' });
+      if (url.includes('wrong-file-id') || url.includes('wrong-asset-pointer')) throw new Error('non-canonical attachment identifier was used');
       throw new Error('unexpected endpoint');
     },
   };
