@@ -43,6 +43,14 @@ async function pageExport(includeImages, includeAttachments) {
       return { error: "ChatGPT did not provide a session access token." };
     }
 
+    const accountIdCandidates = [
+      session && session.account && session.account.id,
+      session && session.account_id,
+      session && session.user && session.user.account_id,
+    ];
+    const accountId =
+      accountIdCandidates.find((value) => typeof value === "string" && value.trim()) || null;
+
     let convo;
     try {
       convo = await fetchJSON(
@@ -53,6 +61,14 @@ async function pageExport(includeImages, includeAttachments) {
     } catch (e) {
       return { error: `Could not fetch the conversation (${e.message}).` };
     }
+
+    const gizmoCandidates = [
+      convo && convo.gizmo_id,
+      convo && convo.conversation_template_id,
+    ];
+    const gizmoId =
+      gizmoCandidates.find((value) => typeof value === "string" && value.trim()) || null;
+    const gizmoIsProject = !!(gizmoId && /^g-p-/i.test(gizmoId));
 
     const activePath = [];
     for (let id = convo.current_node; id; ) {
@@ -309,6 +325,27 @@ async function pageExport(includeImages, includeAttachments) {
       endpoint_2_scoped_resolved: 0,
       endpoint_1_scoped_http_403: 0,
       endpoint_2_scoped_http_403: 0,
+      account_id_present: accountId ? 1 : 0,
+      gizmo_id_present: gizmoId ? 1 : 0,
+      gizmo_is_project: gizmoIsProject ? 1 : 0,
+      account_context_attempts: 0,
+      account_context_resolved: 0,
+      account_context_http_403: 0,
+      project_context_attempts: 0,
+      project_context_resolved: 0,
+      project_context_http_403: 0,
+      endpoint_1_account_context_attempts: 0,
+      endpoint_2_account_context_attempts: 0,
+      endpoint_1_account_context_resolved: 0,
+      endpoint_2_account_context_resolved: 0,
+      endpoint_1_account_context_http_403: 0,
+      endpoint_2_account_context_http_403: 0,
+      endpoint_1_project_context_attempts: 0,
+      endpoint_2_project_context_attempts: 0,
+      endpoint_1_project_context_resolved: 0,
+      endpoint_2_project_context_resolved: 0,
+      endpoint_1_project_context_http_403: 0,
+      endpoint_2_project_context_http_403: 0,
       ...Object.fromEntries([1, 2].flatMap((endpointNumber) =>
         imageResolverOutcomeKeys.map((key) => [`endpoint_${endpointNumber}_${key}`, 0])
       )),
@@ -328,17 +365,23 @@ async function pageExport(includeImages, includeAttachments) {
       resolutionDiagnostics[`endpoint_${endpointNumber}_${key}`]++;
     }
 
-    async function resolveImageEndpoint(endpoint, endpointNumber, scoped) {
+    async function resolveImageEndpoint(endpoint, endpointNumber, stage, requestOptions) {
+      const stagePrefix =
+        stage === "conversation_scoped" ? "scoped" :
+        stage === "account_context" ? "account_context" :
+        stage === "project_context" ? "project_context" :
+        null;
+
       for (let attempt = 0; attempt < 3; attempt++) {
         resolutionDiagnostics.attempts++;
         resolutionDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
-        if (scoped) {
-          resolutionDiagnostics.scoped_attempts++;
-          resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_attempts`]++;
+        if (stagePrefix) {
+          resolutionDiagnostics[`${stagePrefix}_attempts`]++;
+          resolutionDiagnostics[`endpoint_${endpointNumber}_${stagePrefix}_attempts`]++;
         }
 
         try {
-          const response = await fetchWithTimeout(endpoint, auth, 20000);
+          const response = await fetchWithTimeout(endpoint, requestOptions || auth, 20000);
 
           if (!response.ok) {
             const transient = response.status === 429 || response.status >= 500;
@@ -350,9 +393,9 @@ async function pageExport(includeImages, includeAttachments) {
             }
 
             recordResolverHTTP(response.status, endpointNumber);
-            if (scoped && response.status === 403) {
-              resolutionDiagnostics.scoped_http_403++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_http_403`]++;
+            if (stagePrefix && response.status === 403) {
+              resolutionDiagnostics[`${stagePrefix}_http_403`]++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_${stagePrefix}_http_403`]++;
             }
             return { image: null, terminal: response.status === 403 ? "http_403" : "other" };
           }
@@ -376,9 +419,9 @@ async function pageExport(includeImages, includeAttachments) {
             resolutionDiagnostics.resolved++;
             resolutionDiagnostics[`endpoint_${endpointNumber}_success_json`]++;
             resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
-            if (scoped) {
-              resolutionDiagnostics.scoped_resolved++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_resolved`]++;
+            if (stagePrefix) {
+              resolutionDiagnostics[`${stagePrefix}_resolved`]++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_${stagePrefix}_resolved`]++;
             }
             return {
               image: {
@@ -396,8 +439,6 @@ async function pageExport(includeImages, includeAttachments) {
             };
           }
 
-          // A successful non-HTML response is usable even when ChatGPT labels
-          // it as application/octet-stream or omits an image MIME type.
           if (response.redirected || !contentType.includes("text/html")) {
             try {
               if (response.body) response.body.cancel();
@@ -407,9 +448,9 @@ async function pageExport(includeImages, includeAttachments) {
             resolutionDiagnostics.resolved++;
             resolutionDiagnostics[`endpoint_${endpointNumber}_success_response`]++;
             resolutionDiagnostics[`endpoint_${endpointNumber}_resolved`]++;
-            if (scoped) {
-              resolutionDiagnostics.scoped_resolved++;
-              resolutionDiagnostics[`endpoint_${endpointNumber}_scoped_resolved`]++;
+            if (stagePrefix) {
+              resolutionDiagnostics[`${stagePrefix}_resolved`]++;
+              resolutionDiagnostics[`endpoint_${endpointNumber}_${stagePrefix}_resolved`]++;
             }
             return {
               image: {
@@ -442,34 +483,105 @@ async function pageExport(includeImages, includeAttachments) {
     }
 
     async function resolveImage(fid) {
+      const encodedFileId = encodeURIComponent(fid);
       const unscopedEndpoints = [
-        `/backend-api/files/download/${encodeURIComponent(fid)}`,
-        `/backend-api/files/${encodeURIComponent(fid)}/download`,
+        `/backend-api/files/download/${encodedFileId}`,
+        `/backend-api/files/${encodedFileId}/download`,
       ];
       const unscopedTerminalOutcomes = [];
 
       for (let endpointIndex = 0; endpointIndex < unscopedEndpoints.length; endpointIndex++) {
-        const outcome = await resolveImageEndpoint(unscopedEndpoints[endpointIndex], endpointIndex + 1, false);
+        const outcome = await resolveImageEndpoint(
+          unscopedEndpoints[endpointIndex],
+          endpointIndex + 1,
+          "unscoped",
+          auth
+        );
         if (outcome.image) return { fileId: fid, ...outcome.image };
         unscopedTerminalOutcomes.push(outcome.terminal);
       }
 
-      // Preserve the proven fast path for normal images. Only assets that are
-      // rejected with 403 by BOTH legacy endpoint shapes are retried with the
-      // conversation scope that ChatGPT requires for some conversation files.
       if (
         unscopedTerminalOutcomes.length === 2 &&
         unscopedTerminalOutcomes.every((outcome) => outcome === "http_403")
       ) {
         const encodedConversationId = encodeURIComponent(convId);
-        const scopedEndpoints = [
-          `/backend-api/files/download/${encodeURIComponent(fid)}?conversation_id=${encodedConversationId}&inline=false`,
-          `/backend-api/files/${encodeURIComponent(fid)}/download?conversation_id=${encodedConversationId}&inline=false`,
+        const conversationScopedEndpoints = [
+          `/backend-api/files/download/${encodedFileId}?conversation_id=${encodedConversationId}&inline=false`,
+          `/backend-api/files/${encodedFileId}/download?conversation_id=${encodedConversationId}&inline=false`,
         ];
+        const conversationScopedTerminalOutcomes = [];
 
-        for (let endpointIndex = 0; endpointIndex < scopedEndpoints.length; endpointIndex++) {
-          const outcome = await resolveImageEndpoint(scopedEndpoints[endpointIndex], endpointIndex + 1, true);
+        for (let endpointIndex = 0; endpointIndex < conversationScopedEndpoints.length; endpointIndex++) {
+          const outcome = await resolveImageEndpoint(
+            conversationScopedEndpoints[endpointIndex],
+            endpointIndex + 1,
+            "conversation_scoped",
+            auth
+          );
           if (outcome.image) return { fileId: fid, ...outcome.image };
+          conversationScopedTerminalOutcomes.push(outcome.terminal);
+        }
+
+        if (
+          conversationScopedTerminalOutcomes.length === 2 &&
+          conversationScopedTerminalOutcomes.every((outcome) => outcome === "http_403")
+        ) {
+          let accountContextTerminalOutcomes = null;
+
+          if (accountId) {
+            const accountAuth = {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                "chatgpt-account-id": accountId,
+              },
+            };
+            accountContextTerminalOutcomes = [];
+
+            for (let endpointIndex = 0; endpointIndex < conversationScopedEndpoints.length; endpointIndex++) {
+              const outcome = await resolveImageEndpoint(
+                conversationScopedEndpoints[endpointIndex],
+                endpointIndex + 1,
+                "account_context",
+                accountAuth
+              );
+              if (outcome.image) return { fileId: fid, ...outcome.image };
+              accountContextTerminalOutcomes.push(outcome.terminal);
+            }
+          }
+
+          const accountContextAllowsProjectFallback =
+            !accountContextTerminalOutcomes ||
+            (
+              accountContextTerminalOutcomes.length === 2 &&
+              accountContextTerminalOutcomes.every((outcome) => outcome === "http_403")
+            );
+
+          if (gizmoIsProject && accountContextAllowsProjectFallback) {
+            const encodedGizmoId = encodeURIComponent(gizmoId);
+            const projectScopedEndpoints = [
+              `/backend-api/files/download/${encodedFileId}?gizmo_id=${encodedGizmoId}&inline=false`,
+              `/backend-api/files/${encodedFileId}/download?gizmo_id=${encodedGizmoId}&inline=false`,
+            ];
+            const projectAuth = accountId
+              ? {
+                  headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    "chatgpt-account-id": accountId,
+                  },
+                }
+              : auth;
+
+            for (let endpointIndex = 0; endpointIndex < projectScopedEndpoints.length; endpointIndex++) {
+              const outcome = await resolveImageEndpoint(
+                projectScopedEndpoints[endpointIndex],
+                endpointIndex + 1,
+                "project_context",
+                projectAuth
+              );
+              if (outcome.image) return { fileId: fid, ...outcome.image };
+            }
+          }
         }
       }
 

@@ -71,7 +71,7 @@ function loadHelpers(fetchImpl) {
   return Object.assign(context.testAPI, { downloadNames, injectedCalls, createdBlobs, revokedUrls, storageAccesses });
 }
 
-function createPageExportHarness(attachment, resolveEndpoint, previewFileId = null, conversationId = '12345678-1234-1234-1234-123456789012') {
+function createPageExportHarness(attachment, resolveEndpoint, previewFileId = null, conversationId = '12345678-1234-1234-1234-123456789012', resolverContext = {}) {
   const endpointCalls = [];
   const encodedValues = [];
   const attachments = Array.isArray(attachment) ? attachment : [attachment];
@@ -96,16 +96,28 @@ function createPageExportHarness(attachment, resolveEndpoint, previewFileId = nu
     setTimeout,
     clearTimeout,
     fetch: async (url, options) => {
-      if (url === '/api/auth/session') return jsonResponse({ accessToken: 'resolver-test-bearer-secret' });
+      if (url === '/api/auth/session') {
+        const session = { accessToken: 'resolver-test-bearer-secret' };
+        if (resolverContext.accountId) session.account = { id: resolverContext.accountId };
+        return jsonResponse(session);
+      }
       if (url.startsWith('/backend-api/conversation/')) return jsonResponse({
-        title: 'Resolver test', current_node: 'node-1', mapping: { 'node-1': { parent: null, message: {
+        title: 'Resolver test',
+        ...(resolverContext.gizmoId ? { gizmo_id: resolverContext.gizmoId } : {}),
+        ...(resolverContext.conversationTemplateId ? { conversation_template_id: resolverContext.conversationTemplateId } : {}),
+        current_node: 'node-1',
+        mapping: { 'node-1': { parent: null, message: {
           author: { role: 'user' },
           content: { parts: previewFileId ? [{ content_type: 'image_asset_pointer', asset_pointer: `file-service://${previewFileId}` }] : [] },
           metadata: { attachments },
         } } },
       });
-      endpointCalls.push({ url, authorization: options && options.headers && options.headers.Authorization });
-      return resolveEndpoint(url, endpointCalls.length, jsonResponse);
+      endpointCalls.push({
+        url,
+        authorization: options && options.headers && options.headers.Authorization,
+        accountIdHeader: options && options.headers && options.headers['chatgpt-account-id'],
+      });
+      return resolveEndpoint(url, endpointCalls.length, jsonResponse, options);
     },
   };
   vm.createContext(context);
@@ -869,4 +881,134 @@ test('image resolver does not use scoped fallback for terminal failures other th
       assert.equal(result.resolutionDiagnostics.scoped_resolved, 0);
     });
   }
+});
+
+
+test('image resolver does not use account or project context when an earlier path succeeds', async () => {
+  const imageId = 'early-success-image';
+  const signedURL = 'https://files.oaiusercontent.com/early-success.png';
+  const harness = createPageExportHarness(
+    null,
+    (url, _call, jsonResponse) => {
+      if (url === `/backend-api/files/download/${imageId}`) return jsonResponse({ download_url: signedURL });
+      throw new Error('later authorization context should not be used');
+    },
+    imageId,
+    '12345678-1234-1234-1234-123456789012',
+    { accountId: 'private-account-id', gizmoId: 'g-p-private-project-id' }
+  );
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, signedURL);
+  assert.equal(result.resolutionDiagnostics.account_id_present, 1);
+  assert.equal(result.resolutionDiagnostics.gizmo_id_present, 1);
+  assert.equal(result.resolutionDiagnostics.gizmo_is_project, 1);
+  assert.equal(result.resolutionDiagnostics.account_context_attempts, 0);
+  assert.equal(result.resolutionDiagnostics.project_context_attempts, 0);
+});
+
+test('image resolver uses chatgpt-account-id only after prior unscoped and conversation-scoped 403s', async () => {
+  const conversationId = '12345678-1234-1234-1234-123456789012';
+  const accountId = 'private-account-context-id';
+  const imageId = 'account-context-image';
+  const signedURL = 'https://files.oaiusercontent.com/private-account-context-image';
+  const harness = createPageExportHarness(
+    null,
+    (url, _call, jsonResponse, options) => {
+      const header = options && options.headers && options.headers['chatgpt-account-id'];
+      if (url.includes('conversation_id=') && header === accountId) {
+        return jsonResponse({ download_url: signedURL, mime_type: 'image/png' });
+      }
+      return jsonResponse({}, { ok: false, status: 403 });
+    },
+    imageId,
+    conversationId,
+    { accountId }
+  );
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, signedURL);
+  assert.equal(result.resolutionDiagnostics.account_context_attempts, 1);
+  assert.equal(result.resolutionDiagnostics.account_context_resolved, 1);
+  assert.equal(result.resolutionDiagnostics.account_context_http_403, 0);
+  assert.equal(result.resolutionDiagnostics.project_context_attempts, 0);
+  assert.equal(harness.endpointCalls.at(-1).accountIdHeader, accountId);
+
+  const report = loadHelpers().buildExportReport(
+    { detected: 1, downloaded: 1, failed: 0, diagnostics: {} },
+    { detected: 0, downloaded: 0, failed: 0, diagnostics: {} },
+    true,
+    {},
+    result.resolutionDiagnostics,
+    result.imageDiscoveryDiagnostics
+  );
+  assert.match(report, /image-auth-context-account-id-present: 1/);
+  assert.match(report, /image-resolver-account_context-resolved: 1/);
+  for (const secret of [conversationId, accountId, imageId, signedURL, 'resolver-test-bearer-secret']) {
+    assert.equal(report.includes(secret), false);
+  }
+});
+
+test('image resolver falls back to project gizmo context after account-context 403s', async () => {
+  const conversationId = '12345678-1234-1234-1234-123456789012';
+  const accountId = 'private-project-account-id';
+  const gizmoId = 'g-p-private-project-gizmo-id';
+  const imageId = 'project-context-image';
+  const signedURL = 'https://files.oaiusercontent.com/private-project-context-image';
+  const harness = createPageExportHarness(
+    null,
+    (url, _call, jsonResponse, options) => {
+      const header = options && options.headers && options.headers['chatgpt-account-id'];
+      if (url.includes('gizmo_id=') && header === accountId) {
+        return jsonResponse({ download_url: signedURL, mime_type: 'image/png' });
+      }
+      return jsonResponse({}, { ok: false, status: 403 });
+    },
+    imageId,
+    conversationId,
+    { accountId, gizmoId }
+  );
+
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, signedURL);
+  assert.equal(result.resolutionDiagnostics.account_context_attempts, 2);
+  assert.equal(result.resolutionDiagnostics.account_context_resolved, 0);
+  assert.equal(result.resolutionDiagnostics.account_context_http_403, 2);
+  assert.equal(result.resolutionDiagnostics.project_context_attempts, 1);
+  assert.equal(result.resolutionDiagnostics.project_context_resolved, 1);
+  assert.equal(result.resolutionDiagnostics.project_context_http_403, 0);
+  assert.equal(result.resolutionDiagnostics.gizmo_is_project, 1);
+  assert.ok(harness.endpointCalls.at(-1).url.includes(`gizmo_id=${encodeURIComponent(gizmoId)}`));
+  assert.equal(harness.endpointCalls.at(-1).accountIdHeader, accountId);
+
+  const report = loadHelpers().buildExportReport(
+    { detected: 1, downloaded: 1, failed: 0, diagnostics: {} },
+    { detected: 0, downloaded: 0, failed: 0, diagnostics: {} },
+    true,
+    {},
+    result.resolutionDiagnostics,
+    result.imageDiscoveryDiagnostics
+  );
+  assert.match(report, /image-auth-context-gizmo-is-project: 1/);
+  assert.match(report, /image-resolver-project_context-resolved: 1/);
+  for (const secret of [conversationId, accountId, gizmoId, imageId, signedURL]) {
+    assert.equal(report.includes(secret), false);
+  }
+});
+
+test('image resolver stops after conversation-scoped 403s when no extra auth context is available', async () => {
+  const imageId = 'no-extra-context-image';
+  const harness = createPageExportHarness(
+    null,
+    (_url, _call, jsonResponse) => jsonResponse({}, { ok: false, status: 403 }),
+    imageId
+  );
+  const result = await harness.pageExport(true);
+  assert.equal(result.images[0].url, null);
+  assert.equal(result.resolutionDiagnostics.scoped_attempts, 2);
+  assert.equal(result.resolutionDiagnostics.account_id_present, 0);
+  assert.equal(result.resolutionDiagnostics.gizmo_id_present, 0);
+  assert.equal(result.resolutionDiagnostics.account_context_attempts, 0);
+  assert.equal(result.resolutionDiagnostics.project_context_attempts, 0);
+  assert.equal(harness.endpointCalls.length, 4);
 });
