@@ -519,6 +519,14 @@ function buildExportReport(imageResult, attachmentResult, hadToken, attachmentRe
     ...candidateSources.map((source) => `attachment-candidate-resolved-${source}: ${resolver[`candidate_resolved_${source}`] || 0}`),
     `attachment-resolver-attempts: ${resolver.attempts || 0}`,
     `attachment-resolver-resolved: ${resolver.resolved || 0}`,
+    `attachment-resolver-conversation_scoped-attempts: ${resolver.conversation_scoped_attempts || 0}`,
+    `attachment-resolver-conversation_scoped-resolved: ${resolver.conversation_scoped_resolved || 0}`,
+    `attachment-resolver-conversation_scoped-http_403: ${resolver.conversation_scoped_http_403 || 0}`,
+    ...[1, 2].flatMap((endpointNumber) => [
+      `attachment-resolver-endpoint_${endpointNumber}-scoped-attempts: ${resolver[`endpoint_${endpointNumber}_scoped_attempts`] || 0}`,
+      `attachment-resolver-endpoint_${endpointNumber}-scoped-resolved: ${resolver[`endpoint_${endpointNumber}_scoped_resolved`] || 0}`,
+      `attachment-resolver-endpoint_${endpointNumber}-scoped-http_403: ${resolver[`endpoint_${endpointNumber}_scoped_http_403`] || 0}`,
+    ]),
     ...resolverOutcomeKeys.map((key) => `attachment-resolver-${key}: ${resolver[key] || 0}`),
     ...[1, 2].flatMap((endpointNumber) => [
       `attachment-resolver-endpoint_${endpointNumber}-attempts: ${resolver[`endpoint_${endpointNumber}_attempts`] || 0}`,

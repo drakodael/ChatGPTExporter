@@ -71,9 +71,11 @@ function loadHelpers(fetchImpl) {
   return Object.assign(context.testAPI, { downloadNames, injectedCalls, createdBlobs, revokedUrls, storageAccesses });
 }
 
-function createPageExportHarness(attachment, resolveEndpoint, previewFileId = null) {
+function createPageExportHarness(attachment, resolveEndpoint, previewFileId = null, conversationId = '12345678-1234-1234-1234-123456789012') {
   const endpointCalls = [];
+  const encodedValues = [];
   const attachments = Array.isArray(attachment) ? attachment : [attachment];
+  const nativeEncodeURIComponent = encodeURIComponent;
   const jsonResponse = (value, overrides = {}) => ({
     ok: true,
     status: 200,
@@ -85,7 +87,11 @@ function createPageExportHarness(attachment, resolveEndpoint, previewFileId = nu
   });
   const context = {
     window: {},
-    location: { pathname: '/c/12345678-1234-1234-1234-123456789012' },
+    location: { pathname: `/c/${conversationId}` },
+    encodeURIComponent: (value) => {
+      encodedValues.push(value);
+      return nativeEncodeURIComponent(value);
+    },
     AbortController,
     setTimeout,
     clearTimeout,
@@ -106,6 +112,7 @@ function createPageExportHarness(attachment, resolveEndpoint, previewFileId = nu
   vm.runInContext(exporterSource, context);
   return {
     endpointCalls,
+    encodedValues,
     pageExport: (includeImages = false) => vm.runInContext(`pageExport(${includeImages}, true)`, context),
   };
 }
@@ -321,8 +328,8 @@ test('attachment resolver reports endpoint-specific HTTP and JSON failures witho
   const diagnostics = result.attachmentResolverDiagnostics;
 
   assert.equal(harness.endpointCalls.length, 2);
-  assert.match(harness.endpointCalls[0].url, /files\/download\/private-test-file-id$/);
-  assert.match(harness.endpointCalls[1].url, /files\/private-test-file-id\/download$/);
+  assert.equal(harness.endpointCalls[0].url, '/backend-api/files/download/private-test-file-id?conversation_id=12345678-1234-1234-1234-123456789012&inline=false');
+  assert.equal(harness.endpointCalls[1].url, '/backend-api/files/private-test-file-id/download?conversation_id=12345678-1234-1234-1234-123456789012&inline=false');
   assert.equal(diagnostics.id_source_id, 1);
   assert.equal(diagnostics.attempts, 2);
   assert.equal(diagnostics.resolved, 0);
@@ -352,6 +359,70 @@ test('attachment resolver reports endpoint-specific HTTP and JSON failures witho
   assert.match(report, /attachment-resolver-endpoint_2-json_no_url: 1/);
 });
 
+test('attachment resolution scopes both existing endpoints to the conversation and keeps scope data private', async () => {
+  const conversationId = 'abcdefab-cdef-abcd-efab-cdefabcdefab';
+  const candidate = 'file/id?private=value';
+  const signedURL = 'https://files.oaiusercontent.com/signed-private-scope-url';
+  const harness = createPageExportHarness({
+    id: candidate,
+    name: 'private-receipt.pdf',
+    mime_type: 'application/pdf',
+  }, (url, _call, jsonResponse) => {
+    if (url !== `/backend-api/files/download/${encodeURIComponent(candidate)}?conversation_id=${encodeURIComponent(conversationId)}&inline=false`) {
+      throw new Error('unexpected unscoped or reordered resolver request');
+    }
+    return jsonResponse({ download_url: signedURL, private_body_marker: 'private response body' });
+  }, null, conversationId);
+
+  const result = await harness.pageExport();
+  assert.deepEqual(harness.endpointCalls.map(({ url }) => url), [
+    '/backend-api/files/download/file%2Fid%3Fprivate%3Dvalue?conversation_id=abcdefab-cdef-abcd-efab-cdefabcdefab&inline=false',
+  ]);
+  assert.ok(harness.encodedValues.includes(candidate));
+  assert.ok(harness.encodedValues.includes(conversationId));
+  assert.equal(result.attachments[0].attachmentKey, candidate);
+  assert.equal(result.attachments[0].url, signedURL);
+  assert.equal(result.attachmentResolverDiagnostics.conversation_scoped_attempts, 1);
+  assert.equal(result.attachmentResolverDiagnostics.conversation_scoped_resolved, 1);
+  assert.equal(result.attachmentResolverDiagnostics.conversation_scoped_http_403, 0);
+
+  const report = loadHelpers().buildExportReport({}, {}, true, result.attachmentResolverDiagnostics);
+  for (const privateValue of [conversationId, candidate, 'resolver-test-bearer-secret', signedURL, 'private response body']) {
+    assert.equal(report.includes(privateValue), false);
+  }
+  assert.equal(harness.endpointCalls[0].authorization, 'Bearer resolver-test-bearer-secret');
+  assert.match(report, /attachment-resolver-conversation_scoped-attempts: 1/);
+  assert.match(report, /attachment-resolver-conversation_scoped-resolved: 1/);
+  assert.match(report, /attachment-resolver-conversation_scoped-http_403: 0/);
+});
+
+test('attachment resolver falls back from scoped endpoint one to scoped endpoint two after 403', async () => {
+  const conversationId = 'abcdefab-cdef-abcd-efab-cdefabcdefab';
+  const candidate = 'scoped-file-id';
+  const signedURL = 'https://files.oaiusercontent.com/scoped-fallback-url';
+  const harness = createPageExportHarness({ id: candidate, name: 'receipt.pdf', mime_type: 'application/pdf' }, (url, _call, jsonResponse) => {
+    if (url === `/backend-api/files/download/${candidate}?conversation_id=${conversationId}&inline=false`) {
+      return jsonResponse({}, { ok: false, status: 403 });
+    }
+    if (url === `/backend-api/files/${candidate}/download?conversation_id=${conversationId}&inline=false`) {
+      return jsonResponse({ download_url: signedURL });
+    }
+    throw new Error('unscoped endpoint variant was requested');
+  }, null, conversationId);
+
+  const result = await harness.pageExport();
+  assert.deepEqual(harness.endpointCalls.map(({ url }) => url), [
+    `/backend-api/files/download/${candidate}?conversation_id=${conversationId}&inline=false`,
+    `/backend-api/files/${candidate}/download?conversation_id=${conversationId}&inline=false`,
+  ]);
+  assert.equal(result.attachments[0].url, signedURL);
+  assert.equal(result.attachmentResolverDiagnostics.conversation_scoped_attempts, 2);
+  assert.equal(result.attachmentResolverDiagnostics.conversation_scoped_resolved, 1);
+  assert.equal(result.attachmentResolverDiagnostics.conversation_scoped_http_403, 1);
+  assert.equal(result.attachmentResolverDiagnostics.endpoint_1_scoped_http_403, 1);
+  assert.equal(result.attachmentResolverDiagnostics.endpoint_2_scoped_resolved, 1);
+});
+
 test('attachment resolver falls back from both id endpoints to file_id while retaining the logical key', async () => {
   const harness = createPageExportHarness({
     id: 'logical-id-secret',
@@ -361,7 +432,7 @@ test('attachment resolver falls back from both id endpoints to file_id while ret
     mime_type: 'application/pdf',
   }, (url, _call, jsonResponse) => {
     if (url.includes('logical-id-secret')) return jsonResponse({}, { ok: false, status: 403 });
-    if (url === '/backend-api/files/download/resolver-file-id-secret') {
+    if (url === '/backend-api/files/download/resolver-file-id-secret?conversation_id=12345678-1234-1234-1234-123456789012&inline=false') {
       return jsonResponse({ download_url: 'https://files.oaiusercontent.com/signed-url-secret', private_body: 'private response body secret' });
     }
     throw new Error('unexpected resolver candidate or endpoint');
@@ -371,9 +442,9 @@ test('attachment resolver falls back from both id endpoints to file_id while ret
 
   assert.equal(harness.endpointCalls.length, 3);
   assert.deepEqual(harness.endpointCalls.map((call) => call.url), [
-    '/backend-api/files/download/logical-id-secret',
-    '/backend-api/files/logical-id-secret/download',
-    '/backend-api/files/download/resolver-file-id-secret',
+    '/backend-api/files/download/logical-id-secret?conversation_id=12345678-1234-1234-1234-123456789012&inline=false',
+    '/backend-api/files/logical-id-secret/download?conversation_id=12345678-1234-1234-1234-123456789012&inline=false',
+    '/backend-api/files/download/resolver-file-id-secret?conversation_id=12345678-1234-1234-1234-123456789012&inline=false',
   ]);
   assert.equal(result.attachments[0].attachmentKey, 'logical-id-secret');
   assert.equal(result.attachments[0].url, 'https://files.oaiusercontent.com/signed-url-secret');
@@ -464,7 +535,7 @@ test('PDF fallback keeps preview association and replaces the omitted attachment
   }, (url, _call, jsonResponse) => {
     if (url.includes('preview-image-id')) return jsonResponse({ download_url: previewURL, mime_type: 'image/png' });
     if (url.includes('logical-pdf-key')) return jsonResponse({}, { ok: false, status: 403 });
-    if (url === '/backend-api/files/download/working-pdf-candidate') return jsonResponse({ download_url: pdfURL, mime_type: 'application/pdf' });
+    if (url === '/backend-api/files/download/working-pdf-candidate?conversation_id=12345678-1234-1234-1234-123456789012&inline=false') return jsonResponse({ download_url: pdfURL, mime_type: 'application/pdf' });
     throw new Error('unexpected resolver candidate or endpoint');
   }, 'preview-image-id');
   const result = await harness.pageExport(true);
@@ -514,7 +585,7 @@ test('attachment resolver recognizes top-level and metadata download URLs', asyn
 test('attachment resolver distinguishes timeout, network, and HTML without a URL', async () => {
   const harness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, (url, _call, jsonResponse) => {
     if (url.includes('/files/download/')) throw Object.assign(new Error('private transport detail'), { name: 'AbortError' });
-    if (url.endsWith('/download')) return jsonResponse({}, { headers: { get: () => 'text/html' } });
+    if (url.startsWith('/backend-api/files/') && url.includes('/download?conversation_id=')) return jsonResponse({}, { headers: { get: () => 'text/html' } });
     throw new Error('unexpected endpoint');
   });
   const result = await harness.pageExport();
@@ -537,7 +608,7 @@ test('attachment resolver distinguishes timeout, network, and HTML without a URL
 test('attachment resolver retries transient HTTP failures on the same endpoint before resolving', async () => {
   let endpointOneCalls = 0;
   const harness = createPageExportHarness({ id: 'pdf-id', name: 'receipt.pdf', mime_type: 'application/pdf' }, (url, _call, jsonResponse) => {
-    if (url !== '/backend-api/files/download/pdf-id') throw new Error('resolver advanced before bounded retries completed');
+    if (url !== '/backend-api/files/download/pdf-id?conversation_id=12345678-1234-1234-1234-123456789012&inline=false') throw new Error('resolver advanced before bounded retries completed');
     endpointOneCalls++;
     if (endpointOneCalls === 1) return jsonResponse({}, {
       ok: false,

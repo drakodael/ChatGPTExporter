@@ -424,6 +424,15 @@ async function pageExport(includeImages, includeAttachments) {
       ...Object.fromEntries(resolverOutcomeKeys.map((key) => [key, 0])),
       endpoint_1_attempts: 0,
       endpoint_2_attempts: 0,
+      conversation_scoped_attempts: 0,
+      conversation_scoped_resolved: 0,
+      conversation_scoped_http_403: 0,
+      endpoint_1_scoped_attempts: 0,
+      endpoint_1_scoped_resolved: 0,
+      endpoint_1_scoped_http_403: 0,
+      endpoint_2_scoped_attempts: 0,
+      endpoint_2_scoped_resolved: 0,
+      endpoint_2_scoped_http_403: 0,
       ...Object.fromEntries([1, 2].flatMap((endpointNumber) =>
         resolverOutcomeKeys.map((key) => [`endpoint_${endpointNumber}_${key}`, 0])
       )),
@@ -441,10 +450,12 @@ async function pageExport(includeImages, includeAttachments) {
       for (const attachment of attachmentOrder) {
         let found = null;
         let resolvedSource = null;
+        let resolvedEndpointNumber = null;
         for (const candidate of attachment.resolverCandidates) {
+          const encodedConversationId = encodeURIComponent(convId);
           const endpoints = [
-            `/backend-api/files/download/${encodeURIComponent(candidate.value)}`,
-            `/backend-api/files/${encodeURIComponent(candidate.value)}/download`,
+            `/backend-api/files/download/${encodeURIComponent(candidate.value)}?conversation_id=${encodedConversationId}&inline=false`,
+            `/backend-api/files/${encodeURIComponent(candidate.value)}/download?conversation_id=${encodedConversationId}&inline=false`,
           ];
           for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex++) {
             const endpoint = endpoints[endpointIndex];
@@ -452,6 +463,8 @@ async function pageExport(includeImages, includeAttachments) {
             for (let attempt = 0; attempt < 3; attempt++) {
               attachmentResolverDiagnostics.attempts++;
               attachmentResolverDiagnostics[`endpoint_${endpointNumber}_attempts`]++;
+              attachmentResolverDiagnostics.conversation_scoped_attempts++;
+              attachmentResolverDiagnostics[`endpoint_${endpointNumber}_scoped_attempts`]++;
               attachmentResolverDiagnostics[`candidate_attempt_${candidate.source}`]++;
               try {
                 const response = await fetchWithTimeout(endpoint, auth, 20000);
@@ -460,6 +473,10 @@ async function pageExport(includeImages, includeAttachments) {
                   const key = status === 401 ? "http_401" : status === 403 ? "http_403" : status === 404 ? "http_404" : status === 429 ? "http_429" : status >= 500 ? "http_5xx" : "http_other";
                   attachmentDiagnostics[key]++;
                   recordAttachmentResolverOutcome(key, endpointNumber);
+                  if (status === 403) {
+                    attachmentResolverDiagnostics.conversation_scoped_http_403++;
+                    attachmentResolverDiagnostics[`endpoint_${endpointNumber}_scoped_http_403`]++;
+                  }
                   if ((status === 429 || status >= 500) && attempt < 2) {
                     const retryAfter = Number(response.headers.get("retry-after")) || 0;
                     await sleep(Math.min((retryAfter || 2) * 1000 * (attempt + 1), 10000));
@@ -483,6 +500,7 @@ async function pageExport(includeImages, includeAttachments) {
                       mime: (payload.metadata && payload.metadata.mime_type) || payload.mime_type || attachment.mime,
                     };
                     resolvedSource = candidate.source;
+                    resolvedEndpointNumber = endpointNumber;
                     break;
                   }
                   attachmentDiagnostics.no_url++;
@@ -500,6 +518,7 @@ async function pageExport(includeImages, includeAttachments) {
                     mime: attachment.mime,
                   };
                   resolvedSource = candidate.source;
+                  resolvedEndpointNumber = endpointNumber;
                   break;
                 }
 
@@ -524,6 +543,8 @@ async function pageExport(includeImages, includeAttachments) {
         if (found) {
           attachmentDiagnostics.resolved++;
           attachmentResolverDiagnostics.resolved++;
+          attachmentResolverDiagnostics.conversation_scoped_resolved++;
+          attachmentResolverDiagnostics[`endpoint_${resolvedEndpointNumber}_scoped_resolved`]++;
           attachmentResolverDiagnostics[`candidate_resolved_${resolvedSource}`]++;
           attachments.push(found);
         } else {
