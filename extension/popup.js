@@ -314,6 +314,49 @@ async function fetchImagesForArchive(images, accessToken) {
   return { files, failed, diagnostics };
 }
 
+function buildImageExportReport(images, fetched, hadToken) {
+  const d = (fetched && fetched.diagnostics) || {};
+  const detected = Array.isArray(images) ? images.length : 0;
+  const resolvedURLs = (images || []).filter((image) => image && image.url).length;
+  const downloaded = fetched
+    ? [...fetched.files.values()].filter(Boolean).length
+    : 0;
+  const failed = fetched ? fetched.failed : detected;
+
+  const lines = [
+    "ChatGPT Local Exporter - image export report",
+    "Version: 2.4-private",
+    "",
+    `Images detected: ${detected}`,
+    `Images with resolved URL: ${resolvedURLs}`,
+    `Images downloaded: ${downloaded}`,
+    `Images failed: ${failed}`,
+    `Direct signed-URL downloads: ${d.direct_ok || 0}`,
+    `Authenticated downloads: ${d.auth_ok || 0}`,
+    `Transient session token available: ${hadToken ? "yes" : "no"}`,
+    "",
+    "Failure categories:",
+    `no-url: ${d.no_url || 0}`,
+    `invalid-host: ${d.invalid_host || 0}`,
+    `401: ${d.http_401 || 0}`,
+    `403: ${d.http_403 || 0}`,
+    `404: ${d.http_404 || 0}`,
+    `429: ${d.http_429 || 0}`,
+    `5xx: ${d.http_5xx || 0}`,
+    `http-other: ${d.http_other || 0}`,
+    `content-type: ${d.content_type || 0}`,
+    `network: ${d.network || 0}`,
+    "",
+    "Privacy:",
+    "- This report contains aggregate counts only.",
+    "- It does not contain the ChatGPT access token.",
+    "- It does not contain signed URLs or file IDs.",
+    "",
+  ];
+
+  return lines.join("\n");
+}
+
 function buildArchiveMarkdown(markdownTemplate, images, fetched) {
   let markdown = markdownTemplate;
   const entries = [];
@@ -454,10 +497,22 @@ async function exportConversation(includeImages, permissionPromise) {
     const images = result.images || [];
     if (!images.length) {
       const filename = `${base}.zip`;
-      const entries = [{
-        name: "conversation.md",
-        data: new TextEncoder().encode(markdown),
-      }];
+      const emptyFetched = {
+        files: new Map(),
+        failed: 0,
+        diagnostics: {},
+      };
+      const report = buildImageExportReport(images, emptyFetched, false);
+      const entries = [
+        {
+          name: "conversation.md",
+          data: new TextEncoder().encode(markdown),
+        },
+        {
+          name: "export-report.txt",
+          data: new TextEncoder().encode(report),
+        },
+      ];
       downloadBlobFromPopup(filename, buildZipBlob(entries));
       setStatus("✓ ZIP requested. No exportable images were found in this chat.", "ok");
       return;
@@ -473,12 +528,18 @@ async function exportConversation(includeImages, permissionPromise) {
     setStatus("Building ZIP locally…");
 
     const entries = buildArchiveMarkdown(markdown, images, fetched);
+    const report = buildImageExportReport(images, fetched, !!accessToken);
+    entries.push({
+      name: "export-report.txt",
+      data: new TextEncoder().encode(report),
+    });
+
     const filename = `${base}.zip`;
     const zipBlob = buildZipBlob(entries);
 
     downloadBlobFromPopup(filename, zipBlob);
 
-    const downloaded = entries.length - 1;
+    const downloaded = [...fetched.files.values()].filter(Boolean).length;
     if (fetched.failed) {
       const d = fetched.diagnostics || {};
       const reasons = [];
